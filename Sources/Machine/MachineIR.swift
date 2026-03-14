@@ -226,7 +226,7 @@ public enum ShiftOp: UInt8, Sendable {
 
 /// Unary operation sub-opcodes (neg, not).
 public enum GpUnaryOp: UInt8, Sendable {
-    case neg, not
+    case neg, not, inc, dec
 }
 
 /// Compare/test sub-opcodes.

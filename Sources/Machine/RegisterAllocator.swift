@@ -49,18 +49,8 @@ private func fixIllegalInstrs(_ function: inout Function) {
                 fixed.append(.movMR(sz, src: src, dst: gpScratch))
                 fixed.append(.movRM(sz, src: gpScratch, dst: dst))
                 continue
-            case .aluRmiR(let op, let sz, let src, let dst):
-                if case .mem = src {
-                    fixed.append(.mov(sz, src: src, dst: .reg(gpScratch)))
-                    fixed.append(.aluRmiR(op, sz, src: .reg(gpScratch), dst: dst))
-                    continue
-                }
-            case .cmpRmiR(let op, let sz, let src, let dst):
-                if case .mem = src {
-                    fixed.append(.mov(sz, src: src, dst: .reg(gpScratch)))
-                    fixed.append(.cmpRmiR(op, sz, src: .reg(gpScratch), dst: dst))
-                    continue
-                }
+            // aluRmiR/cmpRmiR with .mem src are legal x86-64 instructions
+            // (e.g. addl (%rax), %ecx) — no expansion needed.
             default:
                 break
             }

@@ -404,6 +404,8 @@ extension GpUnaryOp {
         switch self {
         case .neg: return "neg"
         case .not: return "not"
+        case .inc: return "inc"
+        case .dec: return "dec"
         }
     }
 }

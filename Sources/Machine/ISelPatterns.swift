@@ -669,6 +669,38 @@ func buildPatternTable() -> [ISelPattern] {
         }
     ))
 
+    // mul by 3/5/9 → LEA (1 instruction instead of mov+imul)
+    // x*3 = x+x*2 → lea (%r,%r,2), %r
+    // x*5 = x+x*4 → lea (%r,%r,4), %r
+    // x*9 = x+x*8 → lea (%r,%r,8), %r
+    patterns.append(ISelPattern(
+        name: "mulLea",
+        cost: 2,
+        match: { node in
+            guard case .binary(.mul) = node.kind, !isFloat(node.type) else { return false }
+            let sz = sizeOf(node.type)
+            guard sz == .dword || sz == .qword else { return false }
+            // Check if either operand is 3, 5, or 9
+            if let c = intConstValue(node.operands[1]), c == 3 || c == 5 || c == 9 { return true }
+            if let c = intConstValue(node.operands[0]), c == 3 || c == 5 || c == 9 { return true }
+            return false
+        },
+        consumedChildren: { _ in [] },
+        emit: { node, ctx in
+            let sz = sizeOf(node.type)
+            let (valNode, constNode) = intConstValue(node.operands[1]) != nil
+                ? (node.operands[0], node.operands[1])
+                : (node.operands[1], node.operands[0])
+            let c = intConstValue(constNode)!
+            let scale: UInt8 = c == 3 ? 2 : c == 5 ? 4 : 8  // scale = c - 1
+            let val = nodeOperand(valNode, ctx: &ctx)
+            let src = ensureReg(val, size: sz, ctx: &ctx)
+            let dst = ctx.freshVirtual()
+            ctx.instrs.append(.lea(sz, src: Memory(base: src, index: src, scale: scale), dst: dst))
+            return .reg(dst)
+        }
+    ))
+
     // mul (general)
     patterns.append(ISelPattern(
         name: "mul",
