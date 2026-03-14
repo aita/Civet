@@ -16,12 +16,18 @@ public struct CStructMember: Sendable {
     /// Field name. `nil` for anonymous fields.
     public let name: String?
     public let type: CType
+    /// Byte offset of this member within the struct (from chibicc layout).
+    public let offset: Int
+    /// Bit-field offset within the containing storage unit. `nil` for non-bit-fields.
+    public let bitOffset: Int?
     /// Bit-field width in bits. `nil` for ordinary (non-bit-field) members.
     public let bitWidth: Int?
 
-    public init(name: String?, type: CType, bitWidth: Int? = nil) {
+    public init(name: String?, type: CType, offset: Int = 0, bitOffset: Int? = nil, bitWidth: Int? = nil) {
         self.name = name
         self.type = type
+        self.offset = offset
+        self.bitOffset = bitOffset
         self.bitWidth = bitWidth
     }
 }

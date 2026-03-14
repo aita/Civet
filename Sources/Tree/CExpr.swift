@@ -24,7 +24,7 @@ public indirect enum CExpr: Sendable {
     case unary(UnaryOp, CExpr, type: CType)
     case addressOf(CExpr, type: CType)
     case deref(CExpr, type: CType)
-    case member(CExpr, name: String, type: CType)
+    case member(CExpr, name: String, offset: Int32, type: CType)
     case cast(CExpr, to: CType)
     case call(callee: CExpr, args: [CExpr], type: CType)
     /// GNU extension: label address `&&label`.
@@ -44,7 +44,7 @@ public indirect enum CExpr: Sendable {
         case .unary(_, _, let t):               return t
         case .addressOf(_, let t):              return t
         case .deref(_, let t):                  return t
-        case .member(_, _, let t):              return t
+        case .member(_, _, _, let t):             return t
         case .cast(_, let t):                   return t
         case .call(_, _, let t):                return t
         case .labelAddress(_, let t):           return t
