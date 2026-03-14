@@ -44,7 +44,23 @@ public enum CStorage: Sendable {
     /// Local variable or parameter. `id` is unique within the translation unit.
     case local(id: Int)
     /// Global variable. `initData` is `nil` for zero-initialized or declared-only variables.
-    case global(isStatic: Bool, isTLS: Bool, isDefinition: Bool, isTentative: Bool, initData: [UInt8]?)
+    case global(isStatic: Bool, isTLS: Bool, isDefinition: Bool, isTentative: Bool, initData: [UInt8]?, relocations: [CRelocation])
+}
+
+/// A relocation entry for a global variable's initializer data.
+public struct CRelocation: Sendable {
+    /// Byte offset within the initData where the relocation applies.
+    public let offset: Int
+    /// Symbol name to reference.
+    public let label: String
+    /// Addend to add to the symbol address.
+    public let addend: Int64
+
+    public init(offset: Int, label: String, addend: Int64) {
+        self.offset = offset
+        self.label = label
+        self.addend = addend
+    }
 }
 
 /// A variable — local, parameter, or global.
@@ -60,12 +76,16 @@ public struct CVar: Sendable {
     /// Pre-computed stack offset from the C parser (chibicc), if available.
     /// Negative value = offset below rbp.
     public let stackOffset: Int?
+    /// Alignment override from `_Alignas`. `nil` means use natural type alignment.
+    public let align: Int?
 
-    public init(name: String, type: CType, storage: CStorage, loc: SourceLocation? = nil, stackOffset: Int? = nil) {
+    public init(name: String, type: CType, storage: CStorage, loc: SourceLocation? = nil,
+                stackOffset: Int? = nil, align: Int? = nil) {
         self.name = name
         self.type = type
         self.storage = storage
         self.loc = loc
         self.stackOffset = stackOffset
+        self.align = align
     }
 }
