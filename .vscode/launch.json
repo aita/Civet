@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Civet}",
+            "name": "Debug Civet",
+            "target": "Civet",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Civet"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Civet}",
+            "name": "Release Civet",
+            "target": "Civet",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Civet"
+        }
+    ]
+}

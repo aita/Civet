@@ -1,0 +1,7 @@
+{
+  "swift.path": "",
+  "swift.sourcekit-lsp.serverPath": "/usr/bin/sourcekit-lsp",
+  "[swift]": {
+    "editor.defaultFormatter": "sswg.swift-lang"
+  }
+}
