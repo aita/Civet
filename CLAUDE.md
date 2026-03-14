@@ -102,8 +102,8 @@ All optimization passes use `[Int: ...]` dictionaries keyed by variable ID.
 
 ## Test Status
 
-- 26 chibicc tests pass: arith, variable, control, pointer, struct, float, union, enum, sizeof, string, typedef, decl, const, usualconv, compat, generic, typeof, extern, line, asm, builtin, stdhdr, cast, literal, commonsym, unicode
+- 36 chibicc tests pass: alignof, alloca, arith, asm, attribute, bitfield, builtin, cast, commonsym, complit, compat, const, constexpr, control, decl, enum, extern, float, generic, initializer, literal, macro, offsetof, pointer, sizeof, stdhdr, string, struct, typedef, typeof, unicode, union, usualconv, varargs, variable, vla
 - ~136+ inline Swift tests pass (EndToEndTests.swift)
 - 9 optimization pass unit tests (OptimizationPassTests.swift)
 - 4 peephole unit tests (PeepholeTests.swift)
-- 14 tests disabled: function, initializer, complit, constexpr, alignof, attribute, bitfield, offsetof, macro, pragma-once, vla, alloca, varargs, compoundLiteral
+- 4 tests disabled: function (long double), pragma-once (path resolution), atomic (not implemented), tls (not implemented)

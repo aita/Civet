@@ -15,7 +15,7 @@ if [ "$1" = "--inline" ]; then
     exec bash Tests/run.sh
 fi
 
-TESTS="${@:-arith cast control decl enum float function initializer literal pointer sizeof string struct typedef union usualconv variable}"
+TESTS="${@:-alignof alloca arith asm attribute bitfield builtin cast commonsym complit compat const constexpr control decl enum extern float generic initializer literal macro offsetof pointer sizeof stdhdr string struct typedef typeof unicode union usualconv varargs variable vla}"
 
 swift build -q 2>&1
 

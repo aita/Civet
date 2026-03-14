@@ -623,8 +623,7 @@ import Tree
 
     // MARK: - Compound literals
 
-    @Test(.disabled("codegen: compound literal"))
-    func compoundLiteral() throws {
+    @Test func compoundLiteral() throws {
         #expect(try compileAndRun("struct P { int x; int y; }; int main() { struct P p = (struct P){3, 7}; return p.x+p.y; }") == 10)
     }
 
@@ -770,7 +769,7 @@ import Tree
         #expect(try compileAndRunChibiccTest("control.c") == 0)
     }
 
-    @Test(.disabled("codegen: struct pass-by-value, varargs, compound literals"))
+    @Test(.disabled("codegen: long double (x87)"))
     func chibiccFunction() throws {
         #expect(try compileAndRunChibiccTest("function.c") == 0)
     }
@@ -787,7 +786,7 @@ import Tree
         #expect(try compileAndRunChibiccTest("cast.c") == 0)
     }
 
-    @Test(.disabled("codegen: complex initializer patterns"))
+    @Test(.disabled("codegen: anonymous struct designated initializer"))
     func chibiccInitializer() throws {
         #expect(try compileAndRunChibiccTest("initializer.c") == 0)
     }
@@ -796,8 +795,7 @@ import Tree
         #expect(try compileAndRunChibiccTest("literal.c") == 0)
     }
 
-    @Test(.disabled("codegen: compound literal"))
-    func chibiccComplit() throws {
+    @Test func chibiccComplit() throws {
         #expect(try compileAndRunChibiccTest("complit.c") == 0)
     }
 
@@ -805,8 +803,7 @@ import Tree
         #expect(try compileAndRunChibiccTest("commonsym.c") == 0)
     }
 
-    @Test(.disabled("codegen: alloca / constexpr"))
-    func chibiccConstexpr() throws {
+    @Test func chibiccConstexpr() throws {
         #expect(try compileAndRunChibiccTest("constexpr.c") == 0)
     }
 
@@ -815,18 +812,15 @@ import Tree
         #expect(try compileAndRunChibiccTest("alignof.c") == 0)
     }
 
-    @Test(.disabled("codegen: packed struct attribute"))
-    func chibiccAttribute() throws {
+    @Test func chibiccAttribute() throws {
         #expect(try compileAndRunChibiccTest("attribute.c") == 0)
     }
 
-    @Test(.disabled("codegen: bitfield"))
-    func chibiccBitfield() throws {
+    @Test func chibiccBitfield() throws {
         #expect(try compileAndRunChibiccTest("bitfield.c") == 0)
     }
 
-    @Test(.disabled("codegen: offsetof"))
-    func chibiccOffsetof() throws {
+    @Test func chibiccOffsetof() throws {
         #expect(try compileAndRunChibiccTest("offsetof.c") == 0)
     }
 
@@ -844,13 +838,12 @@ import Tree
         #expect(try compileAndRunChibiccTest("float.c") == 0)
     }
 
-    @Test(.disabled("codegen: alloca / VLA"))
+    @Test(.disabled("codegen: 2D VLA element access"))
     func chibiccVla() throws {
         #expect(try compileAndRunChibiccTest("vla.c") == 0)
     }
 
-    @Test(.disabled("codegen: alloca"))
-    func chibiccAlloca() throws {
+    @Test func chibiccAlloca() throws {
         #expect(try compileAndRunChibiccTest("alloca.c") == 0)
     }
 
