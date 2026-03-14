@@ -140,8 +140,15 @@ func collectAddressTaken(in blocks: some Sequence<Block>) -> Set<Int> {
                 ids.insert(id)
             }
             if case .member(_, let base, _, _) = instr,
-               case .variable(_, let id, _) = base {
-                ids.insert(id)
+               case .variable(_, let id, let baseType) = base {
+                // Only mark aggregate-typed bases as address-taken.
+                // Pointer bases (e.g. struct_ptr->field) are just read, not stored through.
+                switch baseType {
+                case .structType, .unionType, .array:
+                    ids.insert(id)
+                default:
+                    break
+                }
             }
             if case .cast(_, let src, _) = instr,
                case .variable(_, let id, let srcType) = src {

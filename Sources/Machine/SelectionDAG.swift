@@ -63,6 +63,7 @@ enum DAGNodeKind {
     case addressOf
     case member(name: String, offset: Int32)
     case structCopy(size: Int)  // operands[0]=dstAddr, operands[1]=srcAddr
+    case alloca                 // operands[0]=size; result = new RSP
 
     // ── Conversion ──────────────────────────────────────────────────
     case cast(from: CType, to: CType)
@@ -82,7 +83,7 @@ enum DAGNodeKind {
     /// Whether this operation has side effects beyond producing a value.
     var hasSideEffects: Bool {
         switch self {
-        case .store, .call, .cas, .exchange, .compare, .test, .inlineAsm, .structCopy:
+        case .store, .call, .cas, .exchange, .compare, .test, .inlineAsm, .structCopy, .alloca:
             return true
         default:
             return false
@@ -108,6 +109,13 @@ struct DAGBuilder {
     private(set) var roots: [DAGNode] = []
     /// Last side-effect node in the chain.
     private var lastSideEffect: DAGNode? = nil
+    /// Load CSE cache: maps address node ID → load node.
+    /// Invalidated conservatively on any store (no alias analysis).
+    private var loadCache: [Int: DAGNode] = [:]
+    /// Cache for varMap variable leaf nodes (deduplication).
+    private var varMapNodes: [Int: DAGNode] = [:]
+    /// Member node CSE: maps (base node ID, offset) → member node.
+    private var memberCache: [Int64: DAGNode] = [:]
 
     init(varMap: [Int: Reg], stackSlots: [Int: Int32]) {
         self.varMap = varMap
@@ -129,7 +137,7 @@ struct DAGBuilder {
     // MARK: - Build
 
     /// Build DAG from COIL instructions in a basic block.
-    mutating func build(instructions: [COIL.Instr]) {
+    mutating func build(instructions: [COIL.Instr], blockLabel: String = "") {
         for instr in instructions {
             buildInstruction(instr)
         }
@@ -154,6 +162,11 @@ struct DAGBuilder {
                     let copySrc = { if case .load = srcNode.kind { return srcNode.operands[0] } else { return srcNode } }()
                     let copyNode = makeNode(.structCopy(size: typeSize(dest.type)),
                                              operands: [slotNode, copySrc], type: .void)
+                    addSideEffect(copyNode)
+                } else if case .array = dest.type {
+                    // Array memzero: use structCopy to zero-fill all bytes.
+                    let copyNode = makeNode(.structCopy(size: typeSize(dest.type)),
+                                             operands: [slotNode, srcNode], type: .void)
                     addSideEffect(copyNode)
                 } else {
                     // Scalar stack-slot variable: emit a store (visible side effect).
@@ -183,8 +196,15 @@ struct DAGBuilder {
 
         case .load(let dest, let addr):
             let addrNode = operandNode(addr)
-            let node = makeNode(.load, operands: [addrNode], type: dest.type)
-            defMap[dest.id] = node
+            // Load CSE: reuse existing load from the same address if no
+            // intervening store has invalidated the cache.
+            if let cached = loadCache[addrNode.id], typeSize(cached.type) == typeSize(dest.type) {
+                defMap[dest.id] = cached
+            } else {
+                let node = makeNode(.load, operands: [addrNode], type: dest.type)
+                defMap[dest.id] = node
+                loadCache[addrNode.id] = node
+            }
 
         case .store(let addr, let value):
             let addrNode = operandNode(addr)
@@ -249,8 +269,20 @@ struct DAGBuilder {
 
         case .member(let dest, let base, let name, let offset):
             let baseNode = operandNode(base)
-            let node = makeNode(.member(name: name, offset: offset),
-                                operands: [baseNode], type: dest.type)
+            let memberKey = Int64(baseNode.id) << 32 | Int64(UInt32(bitPattern: offset))
+            if let cached = memberCache[memberKey] {
+                defMap[dest.id] = cached
+            } else {
+                let node = makeNode(.member(name: name, offset: offset),
+                                    operands: [baseNode], type: dest.type)
+                defMap[dest.id] = node
+                memberCache[memberKey] = node
+            }
+
+        case .alloca(let dest, let size):
+            let sizeNode = operandNode(size)
+            let node = makeNode(.alloca, operands: [sizeNode], type: dest.type)
+            addSideEffect(node)
             defMap[dest.id] = node
 
         case .asm(let text):
@@ -290,7 +322,10 @@ struct DAGBuilder {
             }
             // Check if it's a register-allocated variable
             if varMap[id] != nil {
-                return makeNode(.variable(id: id, name: name), operands: [], type: type)
+                if let cached = varMapNodes[id] { return cached }
+                let node = makeNode(.variable(id: id, name: name), operands: [], type: type)
+                varMapNodes[id] = node
+                return node
             }
             // Check if it's a stack slot
             if let offset = stackSlots[id] {
@@ -359,6 +394,9 @@ struct DAGBuilder {
         node.chainDep = lastSideEffect
         lastSideEffect = node
         roots.append(node)
+        // Conservatively invalidate load cache on any store/call/side-effect,
+        // since any memory write may alias with cached loads.
+        loadCache.removeAll()
     }
 
     /// Mark nodes whose values are used by the terminator or live-out of the block.
