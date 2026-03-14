@@ -373,8 +373,8 @@ public func sccp(in function: Function) -> Function {
             }
         }
 
-        return Block(label: block.label, phis: newPhis,
-                     instructions: finalInstrs, terminator: newTerm)
+        return block.with(phis: newPhis, instructions: finalInstrs)
+            .with(terminator: newTerm)
     }
 
     var result = withBlocks(function, newBlocks)

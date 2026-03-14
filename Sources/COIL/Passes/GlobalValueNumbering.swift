@@ -93,8 +93,8 @@ public func gvn(in function: Function) -> Function {
         }
 
         let term = block.terminator.remapOperands { vt.resolve($0) }
-        newBlocks[bi] = Block(label: block.label, phis: newPhis,
-                              instructions: instrs, terminator: term)
+        newBlocks[bi] = block.with(phis: newPhis, instructions: instrs)
+        newBlocks[bi] = newBlocks[bi].with(terminator: term)
 
         // ── Recurse into dominator tree children ────────────────────────
         for child in domTree.children[bi] {

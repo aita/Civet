@@ -18,8 +18,7 @@ public func strengthReduction(in function: Function) -> Function {
             }
             return simplifyBinary(dest: dest, op: op, lhs: lhs, rhs: rhs) ?? instr
         }
-        return Block(label: block.label, phis: block.phis,
-                     instructions: instrs, terminator: block.terminator)
+        return block.with(instructions: instrs)
     }
     return withBlocks(function, newBlocks)
 }

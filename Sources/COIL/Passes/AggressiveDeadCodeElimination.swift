@@ -14,30 +14,10 @@ public func aggressiveDCE(in function: Function) -> Function {
         let index: Int
     }
 
-    // ── Compute reachable blocks ────────────────────────────────────────
     // SCCP simplifies dead branches to goto but leaves unreachable blocks
     // in place. Including unreachable blocks in defMap would cause ADCE to
     // use dead definitions, hiding the live ones in reachable blocks.
-    let labelIndex = buildLabelIndex(blocks)
-    var reachable = [Bool](repeating: false, count: n)
-    var queue: [Int] = [0]
-    reachable[0] = true
-    // Computed gotos: seed reachable set with all labelAddr targets.
-    let blockLabels = Set(blocks.map(\.label))
-    for target in collectLabelAddrTargets(in: blocks) {
-        if blockLabels.contains(target), let si = labelIndex[target], !reachable[si] {
-            reachable[si] = true
-            queue.append(si)
-        }
-    }
-    while let bi = queue.popLast() {
-        for succ in blocks[bi].terminator.successorLabels {
-            if let si = labelIndex[succ], !reachable[si] {
-                reachable[si] = true
-                queue.append(si)
-            }
-        }
-    }
+    let reachable = computeReachable(blocks)
 
     var defMap: [Int: DefLocation] = [:]
     for (bi, block) in blocks.enumerated() {
@@ -131,7 +111,7 @@ public func aggressiveDCE(in function: Function) -> Function {
         // Unreachable blocks: clear all instructions (they'll be removed by
         // threadJumps/mergeBlocks later).
         guard reachable[bi] else {
-            return Block(label: block.label, phis: [], instructions: [], terminator: block.terminator)
+            return block.with(phis: [], instructions: [])
         }
         let newPhis = block.phis.enumerated().compactMap { (pi, phi) -> Phi? in
             let def = DefLocation(blockIdx: bi, isPhi: true, index: pi)
@@ -157,8 +137,7 @@ public func aggressiveDCE(in function: Function) -> Function {
             return liveInstrs.contains(def) ? instr : nil
         }
 
-        return Block(label: block.label, phis: newPhis,
-                     instructions: newInstrs, terminator: block.terminator)
+        return block.with(phis: newPhis, instructions: newInstrs)
     }
 
     return withBlocks(function, newBlocks)

@@ -257,6 +257,38 @@ public struct Block: Sendable {
   }
 }
 
+extension Block {
+  /// Return a copy with only `instructions` replaced.
+  public func with(instructions: [Instr]) -> Block {
+    Block(label: label, phis: phis, instructions: instructions, terminator: terminator)
+  }
+
+  /// Return a copy with only `phis` replaced.
+  public func with(phis: [Phi]) -> Block {
+    Block(label: label, phis: phis, instructions: instructions, terminator: terminator)
+  }
+
+  /// Return a copy with only `terminator` replaced.
+  public func with(terminator: Terminator) -> Block {
+    Block(label: label, phis: phis, instructions: instructions, terminator: terminator)
+  }
+
+  /// Return a copy with `phis` and `instructions` replaced.
+  public func with(phis: [Phi], instructions: [Instr]) -> Block {
+    Block(label: label, phis: phis, instructions: instructions, terminator: terminator)
+  }
+
+  /// Return a copy with `instructions` and `terminator` replaced.
+  public func with(instructions: [Instr], terminator: Terminator) -> Block {
+    Block(label: label, phis: phis, instructions: instructions, terminator: terminator)
+  }
+
+  /// Return a copy with `phis` and `terminator` replaced.
+  public func with(phis: [Phi], terminator: Terminator) -> Block {
+    Block(label: label, phis: phis, instructions: instructions, terminator: terminator)
+  }
+}
+
 // MARK: - Decl
 
 /// A function in CFG form. `blocks[0]` is the entry block.

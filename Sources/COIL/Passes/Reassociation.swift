@@ -32,8 +32,7 @@ public func reassociation(in function: Function) -> Function {
             return reassociateBinary(dest: dest, op: op, lhs: lhs, rhs: rhs,
                                      defMap: defMap) ?? instr
         }
-        return Block(label: block.label, phis: block.phis,
-                     instructions: instrs, terminator: block.terminator)
+        return block.with(instructions: instrs)
     }
     return withBlocks(function, newBlocks)
 }

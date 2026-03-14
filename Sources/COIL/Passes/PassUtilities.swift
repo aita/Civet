@@ -235,3 +235,32 @@ func buildPredMap(_ blocks: [Block]) -> [String: Set<String>] {
 func instrCount(_ blocks: [Block]) -> Int {
     blocks.reduce(0) { $0 + $1.instructions.count }
 }
+
+// MARK: - Reachability
+
+/// Compute which blocks are reachable from the entry block (index 0).
+/// Handles computed gotos by seeding with `labelAddr` targets.
+func computeReachable(_ blocks: [Block]) -> [Bool] {
+    let n = blocks.count
+    guard n > 0 else { return [] }
+    let labelIndex = buildLabelIndex(blocks)
+    var reachable = [Bool](repeating: false, count: n)
+    var queue: [Int] = [0]
+    reachable[0] = true
+    let blockLabels = Set(blocks.map(\.label))
+    for target in collectLabelAddrTargets(in: blocks) {
+        if blockLabels.contains(target), let si = labelIndex[target], !reachable[si] {
+            reachable[si] = true
+            queue.append(si)
+        }
+    }
+    while let bi = queue.popLast() {
+        for succ in blocks[bi].terminator.successorLabels {
+            if let si = labelIndex[succ], !reachable[si] {
+                reachable[si] = true
+                queue.append(si)
+            }
+        }
+    }
+    return reachable
+}

@@ -122,9 +122,7 @@ public func licm(in function: Function) -> Function {
             }
 
             if remainingInstrs.count != block.instructions.count {
-                blocks[bi] = Block(label: block.label, phis: block.phis,
-                                   instructions: remainingInstrs,
-                                   terminator: block.terminator)
+                blocks[bi] = block.with(instructions: remainingInstrs)
             }
         }
     }

@@ -2,26 +2,11 @@
 
 /// Remove blocks unreachable from the entry block.
 public func eliminateDeadBlocks(in function: Function) -> Function {
-    guard let entry = function.blocks.first else { return function }
-    var reachable: Set<String> = [entry.label]
-    var worklist = [entry.label]
-
-    // Computed gotos (&&label / goto *p) can jump to any labeled block.
-    let blockLabels = Set(function.blocks.map(\.label))
-    for target in collectLabelAddrTargets(in: function.blocks) {
-        if blockLabels.contains(target), reachable.insert(target).inserted {
-            worklist.append(target)
-        }
-    }
-
-    let blockMap = Dictionary(uniqueKeysWithValues: function.blocks.map { ($0.label, $0) })
-    while let label = worklist.popLast() {
-        for succ in blockMap[label]!.terminator.successorLabels {
-            if reachable.insert(succ).inserted {
-                worklist.append(succ)
-            }
-        }
-    }
+    guard !function.blocks.isEmpty else { return function }
+    let reachableFlags = computeReachable(function.blocks)
+    let reachable = Set(function.blocks.enumerated().compactMap { (i, b) in
+        reachableFlags[i] ? b.label : nil
+    })
     var filtered = function.blocks.filter { reachable.contains($0.label) }
     guard filtered.count != function.blocks.count else { return function }
 
@@ -33,8 +18,7 @@ public func eliminateDeadBlocks(in function: Function) -> Function {
             let newPhis = block.phis.map { phi in
                 Phi(dest: phi.dest, args: phi.args.filter { !removed.contains($0.label) })
             }
-            return Block(label: block.label, phis: newPhis,
-                         instructions: block.instructions, terminator: block.terminator)
+            return block.with(phis: newPhis)
         }
     }
     var result = withBlocks(function, filtered)
@@ -87,8 +71,7 @@ public func threadJumps(in function: Function) -> Function {
     }
 
     var newBlocks = function.blocks.map { block in
-        Block(label: block.label, phis: block.phis, instructions: block.instructions,
-              terminator: block.terminator.remapLabels { resolve($0) })
+        block.with(terminator: block.terminator.remapLabels { resolve($0) })
     }
 
     // Check for conflicts: if forwarding would create duplicate phi args from
@@ -138,8 +121,7 @@ public func threadJumps(in function: Function) -> Function {
     // Re-resolve chains after removing unsafe entries.
     // Rebuild newBlocks with cleaned forwarding.
     newBlocks = function.blocks.map { block in
-        Block(label: block.label, phis: block.phis, instructions: block.instructions,
-              terminator: block.terminator.remapLabels { resolve($0) })
+        block.with(terminator: block.terminator.remapLabels { resolve($0) })
     }
 
     // Fix up phis: replace forwarded block labels with their real predecessors.
@@ -160,8 +142,7 @@ public func threadJumps(in function: Function) -> Function {
             }
             return Phi(dest: phi.dest, args: newArgs)
         }
-        return Block(label: block.label, phis: newPhis,
-                     instructions: block.instructions, terminator: block.terminator)
+        return block.with(phis: newPhis)
     }
 
     return eliminateDeadBlocks(in: withBlocks(function, newBlocks))
@@ -196,9 +177,8 @@ public func mergeBlocks(in function: Function) -> Function {
                     let val = phi.args.first?.value ?? .intConst(0, type: phi.dest.type)
                     return .assign(dest: phi.dest, src: val)
                 }
-                block = Block(label: block.label, phis: block.phis,
-                              instructions: block.instructions + phiAssigns + succ.instructions,
-                              terminator: succ.terminator)
+                block = block.with(instructions: block.instructions + phiAssigns + succ.instructions,
+                                   terminator: succ.terminator)
                 labelRename[target] = block.label
                 removed.insert(target)
                 changed = true
@@ -216,8 +196,7 @@ public func mergeBlocks(in function: Function) -> Function {
                         (label: labelRename[arg.label] ?? arg.label, value: arg.value)
                     })
                 }
-                return Block(label: block.label, phis: newPhis,
-                             instructions: block.instructions, terminator: block.terminator)
+                return block.with(phis: newPhis)
             }
         }
     }

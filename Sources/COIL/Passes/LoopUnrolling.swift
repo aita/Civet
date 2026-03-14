@@ -266,8 +266,7 @@ public func loopUnroll(in function: Function) -> Function {
 
             clonedBlocks.append(Block(
                 label: newLabel, phis: newPhis,
-                instructions: newInstrs, terminator: newTerm
-            ))
+                instructions: newInstrs, terminator: newTerm))
         }
 
         // Create trampoline blocks.
@@ -283,24 +282,18 @@ public func loopUnroll(in function: Function) -> Function {
         // === Wire the original and clone together ===
 
         // 1. Original latch's back-edge → clone header.
-        blocks[latchIdx] = Block(
-            label: latchLabel, phis: blocks[latchIdx].phis,
-            instructions: blocks[latchIdx].instructions,
+        blocks[latchIdx] = blocks[latchIdx].with(
             terminator: blocks[latchIdx].terminator.remapLabels {
                 $0 == headerLabel ? cloneHeaderLabel : $0
-            }
-        )
+            })
 
         // 2. Clone's latch back-edge → original header.
         for (ci, cloneBlock) in clonedBlocks.enumerated() {
             if cloneBlock.label == cloneLatchLabel {
-                clonedBlocks[ci] = Block(
-                    label: cloneBlock.label, phis: cloneBlock.phis,
-                    instructions: cloneBlock.instructions,
+                clonedBlocks[ci] = cloneBlock.with(
                     terminator: cloneBlock.terminator.remapLabels {
                         $0 == cloneHeaderLabel ? headerLabel : $0
-                    }
-                )
+                    })
             }
         }
 
@@ -314,11 +307,7 @@ public func loopUnroll(in function: Function) -> Function {
             }
             return Phi(dest: phi.dest, args: newArgs)
         }
-        blocks[headerIdx] = Block(
-            label: headerLabel, phis: newHeaderPhis,
-            instructions: blocks[headerIdx].instructions,
-            terminator: blocks[headerIdx].terminator
-        )
+        blocks[headerIdx] = blocks[headerIdx].with(phis: newHeaderPhis)
 
         // 4. Update exit blocks: add phis to merge original and trampoline values.
         for (exitLabel, info) in trampolineInfos {
@@ -443,21 +432,14 @@ public func loopUnroll(in function: Function) -> Function {
                             }
                             return Phi(dest: phi.dest, args: updatedArgs)
                         }
-                        if true {  // always update to be safe
-                            blocks[succIdx] = Block(
-                                label: succBlock.label, phis: updatedPhis,
-                                instructions: succBlock.instructions,
-                                terminator: succBlock.terminator
-                            )
-                        }
+                        blocks[succIdx] = succBlock.with(phis: updatedPhis)
                     }
                 }
             }
 
             blocks[exitIdx] = Block(
                 label: exitLabel, phis: newPhis,
-                instructions: newInstrs, terminator: newTerm
-            )
+                instructions: newInstrs, terminator: newTerm)
         }
 
         // 5. Insert cloned blocks + trampolines.

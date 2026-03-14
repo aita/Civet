@@ -1,7 +1,6 @@
-/// Run all optimization passes on a function.
-public func optimize(_ function: Function) -> Function {
+/// Run all optimization passes in a fixpoint loop (up to 4 iterations).
+private func optimizeLoop(_ function: Function) -> Function {
     var f = function
-    // First pass: optimize, then unroll loops.
     for _ in 0..<4 {
         let prevBlocks = f.blocks
         f = sccp(in: f)
@@ -17,25 +16,17 @@ public func optimize(_ function: Function) -> Function {
         if f.blocks.count == prevBlocks.count &&
            instrCount(f.blocks) == instrCount(prevBlocks) { break }
     }
+    return f
+}
+
+/// Run all optimization passes on a function.
+public func optimize(_ function: Function) -> Function {
+    var f = optimizeLoop(function)
     // Unroll after optimization stabilizes, then re-optimize.
     let preUnroll = instrCount(f.blocks)
     f = loopUnroll(in: f)
     if instrCount(f.blocks) != preUnroll {
-        for _ in 0..<4 {
-            let prevBlocks = f.blocks
-            f = sccp(in: f)
-            f = strengthReduction(in: f)
-            f = reassociation(in: f)
-            f = gvn(in: f)
-            f = aggressiveDCE(in: f)
-            f = codeSinking(in: f)
-            f = licm(in: f)
-            f = deadStoreElimination(in: f)
-            f = threadJumps(in: f)
-            f = mergeBlocks(in: f)
-            if f.blocks.count == prevBlocks.count &&
-               instrCount(f.blocks) == instrCount(prevBlocks) { break }
-        }
+        f = optimizeLoop(f)
     }
     return f
 }

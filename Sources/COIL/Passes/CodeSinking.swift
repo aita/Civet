@@ -96,18 +96,12 @@ public func codeSinking(in function: Function) -> Function {
             toInsert[c.dstLabel, default: []].insert(sunk, at: 0)
         }
 
-        newBlocks[srcIdx] = Block(label: newBlocks[srcIdx].label,
-                                   phis: newBlocks[srcIdx].phis,
-                                   instructions: srcInstrs,
-                                   terminator: newBlocks[srcIdx].terminator)
+        newBlocks[srcIdx] = newBlocks[srcIdx].with(instructions: srcInstrs)
 
         for (dstLabel, sunkInstrs) in toInsert {
             guard let dstIdx = blockIndex[dstLabel] else { continue }
-            newBlocks[dstIdx] = Block(
-                label: newBlocks[dstIdx].label,
-                phis:  newBlocks[dstIdx].phis,
-                instructions: sunkInstrs + newBlocks[dstIdx].instructions,
-                terminator: newBlocks[dstIdx].terminator)
+            newBlocks[dstIdx] = newBlocks[dstIdx].with(
+                instructions: sunkInstrs + newBlocks[dstIdx].instructions)
         }
     }
 

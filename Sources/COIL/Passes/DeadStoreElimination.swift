@@ -132,8 +132,7 @@ public func deadStoreElimination(in function: Function) -> Function {
                 newInstrs.append(instr)
             }
         }
-        newBlocks[bi] = Block(label: block.label, phis: block.phis,
-                               instructions: newInstrs, terminator: block.terminator)
+        newBlocks[bi] = block.with(instructions: newInstrs)
     }
     return withBlocks(function, newBlocks)
 }
