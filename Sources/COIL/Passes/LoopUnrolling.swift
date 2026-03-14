@@ -157,6 +157,8 @@ public func loopUnroll(in function: Function) -> Function {
                 return .exchange(dest: remapPlace(d), addr: a, value: v)
             case .member(let d, let b, let name, let off):
                 return .member(dest: remapPlace(d), base: b, name: name, offset: off)
+            case .alloca(let d, let s):
+                return .alloca(dest: remapPlace(d), size: s)
             case .asm(let s):
                 return .asm(s)
             case .compare(let l, let rhs):

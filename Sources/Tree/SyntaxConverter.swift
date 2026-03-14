@@ -109,7 +109,10 @@ public final class SyntaxConverter {
     }
 
     private func convertMember(_ m: SyntaxMember) -> CStructMember {
-        CStructMember(name: m.name, type: convertType(m.type), bitWidth: m.bitfield?.bitWidth)
+        CStructMember(name: m.name, type: convertType(m.type),
+                      offset: m.offset,
+                      bitOffset: m.bitfield?.bitOffset,
+                      bitWidth: m.bitfield?.bitWidth)
     }
 
     private func cache(_ type: CType, for key: ObjectIdentifier) -> CType {
@@ -128,8 +131,8 @@ public final class SyntaxConverter {
     public func convertFunction(_ f: SyntaxFunction) -> CFunction {
         synthLocals = []
 
-        let params    = f.params.map { CVar(name: $0.name, type: convertType($0.type), storage: .local(id: $0.id), stackOffset: $0.offset) }
-        let srcLocals = f.locals.map { CVar(name: $0.name, type: convertType($0.type), storage: .local(id: $0.id), stackOffset: $0.offset) }
+        let params    = f.params.map { CVar(name: $0.name, type: convertType($0.type), storage: .local(id: $0.id), stackOffset: $0.offset, align: $0.align) }
+        let srcLocals = f.locals.map { CVar(name: $0.name, type: convertType($0.type), storage: .local(id: $0.id), stackOffset: $0.offset, align: $0.align) }
         let body      = f.body.map { convertStmt($0) }
 
         let retType: CType
@@ -148,7 +151,10 @@ public final class SyntaxConverter {
     }
 
     public func convertGlobal(_ g: SyntaxGlobalVariable) -> CVar {
-        CVar(
+        let relocs = g.relocations.map { r in
+            CRelocation(offset: r.offset, label: r.label, addend: r.addend)
+        }
+        return CVar(
             name: g.name,
             type: convertType(g.type),
             storage: .global(
@@ -156,8 +162,10 @@ public final class SyntaxConverter {
                 isTLS:        g.isTLS,
                 isDefinition: g.isDefinition,
                 isTentative:  g.isTentative,
-                initData:     g.initData),
-            loc: g.loc)
+                initData:     g.initData,
+                relocations:  relocs),
+            loc: g.loc,
+            align: g.align)
     }
 
     // MARK: - Statement conversion
@@ -476,6 +484,7 @@ public final class SyntaxConverter {
         case .member(let expr, let member, let ty, _):
             return .member(convertExpr(expr, into: &buf),
                            name: member.name ?? "",
+                           offset: Int32(member.offset),
                            type: convertType(ty))
 
         // ── Assignment ────────────────────────────────────────────────────────

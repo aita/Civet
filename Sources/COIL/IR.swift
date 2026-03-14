@@ -61,6 +61,8 @@ public enum Instr: Sendable {
   case cas(dest: Place, addr: Operand, old: Operand, new: Operand)
   case exchange(dest: Place, addr: Operand, value: Operand)
   case member(dest: Place, base: Operand, name: String, offset: Int32 = 0)
+  /// Dynamic stack allocation: dest = alloca(size). Lowers to RSP adjustment.
+  case alloca(dest: Place, size: Operand)
   case asm(String)
 
   // ── Flag-setting instructions (no dest) ───────────────────────────
@@ -74,7 +76,8 @@ public enum Instr: Sendable {
     switch self {
     case .assign(let d, _), .binary(let d, _, _, _), .unary(let d, _, _),
       .addressOf(let d, _), .load(let d, _), .cast(let d, _, _),
-      .cas(let d, _, _, _), .exchange(let d, _, _), .member(let d, _, _, _):
+      .cas(let d, _, _, _), .exchange(let d, _, _), .member(let d, _, _, _),
+      .alloca(let d, _):
       return d
     case .call(let d, _, _):
       return d
@@ -97,6 +100,7 @@ public enum Instr: Sendable {
     case .cas(_, let a, let o, let n): return [a, o, n]
     case .exchange(_, let a, let v): return [a, v]
     case .member(_, let b, _, _): return [b]
+    case .alloca(_, let s): return [s]
     case .asm: return []
     case .compare(let l, let r): return [l, r]
     case .test(let v): return [v]
@@ -106,7 +110,7 @@ public enum Instr: Sendable {
   /// Whether this instruction may have side effects beyond writing to `dest`.
   public var hasSideEffects: Bool {
     switch self {
-    case .call, .store, .cas, .exchange, .asm, .compare, .test:
+    case .call, .store, .cas, .exchange, .asm, .compare, .test, .alloca:
       return true
     default:
       return false
@@ -138,6 +142,8 @@ public enum Instr: Sendable {
       return .exchange(dest: d, addr: f(a), value: f(v))
     case .member(let d, let b, let name, let off):
       return .member(dest: d, base: f(b), name: name, offset: off)
+    case .alloca(let d, let s):
+      return .alloca(dest: d, size: f(s))
     case .asm:
       return self
     case .compare(let l, let r):

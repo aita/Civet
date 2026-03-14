@@ -70,7 +70,7 @@ public struct SSABuilder {
                 // cannot be meaningfully phi-merged as register values.
                 guard id > 0, !addressTaken.contains(id) else { continue }
                 switch dest.type {
-                case .structType, .unionType: continue
+                case .structType, .unionType, .vla: continue
                 default: break
                 }
                 varTypes[id] = dest.type
@@ -302,6 +302,7 @@ private struct VariableRenamer {
         case .cas(_, let a, let o, let n): return .cas(dest: newDest, addr: a, old: o, new: n)
         case .exchange(_, let a, let v): return .exchange(dest: newDest, addr: a, value: v)
         case .member(_, let b, let name, let off): return .member(dest: newDest, base: b, name: name, offset: off)
+        case .alloca(_, let s): return .alloca(dest: newDest, size: s)
         case .store, .asm, .compare, .test: return instr
         }
     }

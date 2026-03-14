@@ -144,6 +144,8 @@ private func describe(_ instr: Instr) -> String {
         return "\(d.name) = xchg(\(describe(addr)), \(describe(val)))"
     case .member(let d, let base, let name, _):
         return "\(d.name) = \(describe(base)).\(name)"
+    case .alloca(let d, let size):
+        return "\(d.name) = alloca \(describe(size))"
     case .asm(let text):
         return "asm \"\(text)\""
     case .compare(let l, let r):
