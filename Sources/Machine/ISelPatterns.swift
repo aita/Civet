@@ -1,5 +1,23 @@
 import Tree
 
+// MARK: - BinaryOp extensions for ISel
+
+extension BinaryOp {
+    var sseOp: SseOp? {
+        switch self {
+        case .add: .add; case .sub: .sub; case .mul: .mul; case .div: .div
+        default: nil
+        }
+    }
+    var aluOp: AluOp? {
+        switch self {
+        case .bitAnd: .and; case .bitOr: .or; case .bitXor: .xor
+        case .add: .add; case .sub: .sub
+        default: nil
+        }
+    }
+}
+
 // MARK: - Pattern Definition
 
 /// An instruction selection pattern that matches a DAG subtree and emits x86-64 instructions.
@@ -101,14 +119,12 @@ private func ensureReg(_ op: Operand, size: Size, ctx: inout ISelContext) -> Reg
     // Materialize float constants from memory instead.
     if (size == .single || size == .double_), case .imm(let v) = op {
         let fop = materializeFloat(Double(v),
-            type: size == .single ? .float : .double, ctx: &ctx)
+            type: floatType(for: size), ctx: &ctx)
         if case .reg(let r) = fop { return r }
     }
     let tmp = ctx.freshVirtual()
-    if size == .single {
-        ctx.instrs.append(.xmmMov(.single, src: op, dst: .reg(tmp)))
-    } else if size == .double_ {
-        ctx.instrs.append(.xmmMov(.double_, src: op, dst: .reg(tmp)))
+    if size == .single || size == .double_ {
+        ctx.instrs.append(.xmmMov(size, src: op, dst: .reg(tmp)))
     } else {
         ctx.instrs.append(.mov(size, src: op, dst: .reg(tmp)))
     }
@@ -178,10 +194,60 @@ func materializeFloat(_ value: Double, type: CType, ctx: inout ISelContext) -> O
 
     let reg = ctx.freshVirtual()
     let mem = Memory.global(label)
-    ctx.instrs.append(sz == .single
-        ? .xmmMovMR(.single, src: mem, dst: reg)
-        : .xmmMovMR(.double_, src: mem, dst: reg))
+    ctx.instrs.append(.xmmMovMR(sz, src: mem, dst: reg))
     return .reg(reg)
+}
+
+/// Map a float Size (.single/.double_) to the corresponding CType.
+private func floatType(for sz: Size) -> CType {
+    sz == .single ? .float : .double
+}
+
+/// Emit a load from memory, choosing XMM or GP instruction based on float flag.
+private func emitLoad(sz: Size, from mem: Memory, to dst: Reg, float: Bool, ctx: inout ISelContext) {
+    if float {
+        ctx.instrs.append(.xmmMovMR(sz, src: mem, dst: dst))
+    } else {
+        ctx.instrs.append(.movMR(sz, src: mem, dst: dst))
+    }
+}
+
+/// Emit a store to memory, choosing XMM or GP instruction based on float flag.
+private func emitStore(sz: Size, val: Operand, to mem: Memory, float: Bool, ctx: inout ISelContext) {
+    if float {
+        let srcReg = ensureReg(val, size: sz, ctx: &ctx)
+        ctx.instrs.append(.xmmMovRM(sz, src: srcReg, dst: mem))
+    } else {
+        let src = ensureRegOrImm(val, size: sz, ctx: &ctx)
+        ctx.instrs.append(.mov(sz, src: src, dst: .mem(mem)))
+    }
+}
+
+/// Emit a block memory transfer (copy or zero-fill) using qword/dword/word/byte chunks.
+/// If `srcReg` is nil, zero-fills the destination instead of copying.
+func emitBlockTransfer(to dstReg: Reg, from srcReg: Reg?, size: Int, ctx: inout ISelContext) {
+    var offset: Int32 = 0
+    var remaining = size
+    let zeroReg: Reg?
+    if srcReg == nil {
+        zeroReg = ctx.freshVirtual()
+        ctx.instrs.append(.movIR(.qword, imm: 0, dst: zeroReg!))
+    } else {
+        zeroReg = nil
+    }
+    for (chunkBytes, chunkSz) in [(8, Size.qword), (4, Size.dword), (2, Size.word), (1, Size.byte)] as [(Int, Size)] {
+        while remaining >= chunkBytes {
+            if let src = srcReg {
+                let tmp = ctx.freshVirtual()
+                ctx.instrs.append(.movMR(chunkSz, src: Memory(base: src, displacement: offset), dst: tmp))
+                ctx.instrs.append(.movRM(chunkSz, src: tmp, dst: Memory(base: dstReg, displacement: offset)))
+            } else {
+                ctx.instrs.append(.movRM(chunkSz, src: zeroReg!, dst: Memory(base: dstReg, displacement: offset)))
+            }
+            offset += Int32(chunkBytes)
+            remaining -= chunkBytes
+        }
+    }
 }
 
 /// Get or emit the operand for a DAG node.
@@ -291,74 +357,31 @@ func buildPatternTable() -> [ISelPattern] {
         }
     ))
 
-    // lea_mul3: mul(x, const(3)) → lea (x, x, 2)
-    patterns.append(ISelPattern(
-        name: "lea_mul3",
-        cost: 1,
-        match: { node in
-            guard case .binary(.mul) = node.kind,
-                  !isFloat(node.type),
-                  sizeOf(node.type) == .dword || sizeOf(node.type) == .qword
-            else { return false }
-            return isIntConst(node.operands[1], value: 3)
-        },
-        consumedChildren: { _ in [] },
-        emit: { node, ctx in
-            let sz = sizeOf(node.type)
-            let x = nodeOperand(node.operands[0], ctx: &ctx)
-            let xReg = ensureReg(x, size: sz, ctx: &ctx)
-            let dst = ctx.freshVirtual()
-            let mem = Memory(base: xReg, index: xReg, scale: 2)
-            ctx.instrs.append(.lea(sz, src: mem, dst: dst))
-            return .reg(dst)
-        }
-    ))
-
-    // lea_mul5: mul(x, const(5)) → lea (x, x, 4)
-    patterns.append(ISelPattern(
-        name: "lea_mul5",
-        cost: 1,
-        match: { node in
-            guard case .binary(.mul) = node.kind,
-                  !isFloat(node.type),
-                  sizeOf(node.type) == .dword || sizeOf(node.type) == .qword
-            else { return false }
-            return isIntConst(node.operands[1], value: 5)
-        },
-        consumedChildren: { _ in [] },
-        emit: { node, ctx in
-            let sz = sizeOf(node.type)
-            let x = nodeOperand(node.operands[0], ctx: &ctx)
-            let xReg = ensureReg(x, size: sz, ctx: &ctx)
-            let dst = ctx.freshVirtual()
-            let mem = Memory(base: xReg, index: xReg, scale: 4)
-            ctx.instrs.append(.lea(sz, src: mem, dst: dst))
-            return .reg(dst)
-        }
-    ))
-
-    // lea_mul9: mul(x, const(9)) → lea (x, x, 8)
-    patterns.append(ISelPattern(
-        name: "lea_mul9",
-        cost: 1,
-        match: { node in
-            guard case .binary(.mul) = node.kind,
-                  !isFloat(node.type),
-                  sizeOf(node.type) == .dword || sizeOf(node.type) == .qword
-            else { return false }
-            return isIntConst(node.operands[1], value: 9)
-        },
-        consumedChildren: { _ in [] },
-        emit: { node, ctx in
-            let sz = sizeOf(node.type)
-            let x = nodeOperand(node.operands[0], ctx: &ctx)
-            let xReg = ensureReg(x, size: sz, ctx: &ctx)
-            let dst = ctx.freshVirtual()
-            let mem = Memory(base: xReg, index: xReg, scale: 8)
-            ctx.instrs.append(.lea(sz, src: mem, dst: dst))
-            return .reg(dst)
-        }
-    ))
+    // lea_mul3/5/9: mul(x, const(3|5|9)) → lea (x, x, scale)
+    for (constVal, scale, name) in [(Int64(3), UInt8(2), "lea_mul3"),
+                                     (Int64(5), UInt8(4), "lea_mul5"),
+                                     (Int64(9), UInt8(8), "lea_mul9")] {
+        patterns.append(ISelPattern(
+            name: name,
+            cost: 1,
+            match: { node in
+                guard case .binary(.mul) = node.kind,
+                      !isFloat(node.type),
+                      sizeOf(node.type) == .dword || sizeOf(node.type) == .qword
+                else { return false }
+                return isIntConst(node.operands[1], value: constVal)
+            },
+            consumedChildren: { _ in [] },
+            emit: { node, ctx in
+                let sz = sizeOf(node.type)
+                let x = nodeOperand(node.operands[0], ctx: &ctx)
+                let xReg = ensureReg(x, size: sz, ctx: &ctx)
+                let dst = ctx.freshVirtual()
+                ctx.instrs.append(.lea(sz, src: Memory(base: xReg, index: xReg, scale: scale), dst: dst))
+                return .reg(dst)
+            }
+        ))
+    }
 
     // ── Multiply special cases ──────────────────────────────────────
 
@@ -709,6 +732,7 @@ func buildPatternTable() -> [ISelPattern] {
     // bitwise: and, or, xor
     for (op, instrName): (BinaryOp, String) in [(.bitAnd, "and"), (.bitOr, "or"), (.bitXor, "xor")] {
         let capturedOp = op
+        let aluOp = op.aluOp!
         patterns.append(ISelPattern(
             name: instrName,
             cost: 2,
@@ -724,12 +748,7 @@ func buildPatternTable() -> [ISelPattern] {
                 let r = nodeOperand(node.operands[1], ctx: &ctx)
                 let dst = ctx.freshVirtual()
                 ctx.instrs.append(.mov(sz, src: l, dst: .reg(dst)))
-                switch capturedOp {
-                case .bitAnd: ctx.instrs.append(.aluRmiR(.and, sz, src: r, dst: dst))
-                case .bitOr:  ctx.instrs.append(.aluRmiR(.or, sz, src: r, dst: dst))
-                case .bitXor: ctx.instrs.append(.aluRmiR(.xor, sz, src: r, dst: dst))
-                default: break
-                }
+                ctx.instrs.append(.aluRmiR(aluOp, sz, src: r, dst: dst))
                 return .reg(dst)
             }
         ))
@@ -766,6 +785,11 @@ func buildPatternTable() -> [ISelPattern] {
     for (op, cc): (BinaryOp, CondCode) in [(.eq, .e), (.ne, .ne), (.lt, .l), (.le, .le)] {
         let capturedOp = op
         let capturedCC = cc
+        // Precompute float condition code: lt→b, le→be, else same as int CC
+        let floatCC: CondCode = (op == .lt) ? .b : (op == .le) ? .be : cc
+        // Precompute unsigned int condition code: lt→b, le→be
+        let unsignedCC: CondCode? = (op == .lt) ? .b : (op == .le) ? .be : nil
+        let isNeParity = (op == .ne)
         patterns.append(ISelPattern(
             name: "cmp_\(capturedOp)",
             cost: 3,
@@ -783,16 +807,12 @@ func buildPatternTable() -> [ISelPattern] {
                 if isFloat(operandType) {
                     let lReg = ensureReg(l, size: sz, ctx: &ctx)
                     let rReg = ensureReg(r, size: sz, ctx: &ctx)
-                    ctx.instrs.append(sz == .single
-                        ? .xmmCmp(.single, src: .reg(rReg), dst: lReg)
-                        : .xmmCmp(.double_, src: .reg(rReg), dst: lReg))
-                    let floatCC: CondCode = (capturedOp == .lt) ? .b
-                        : (capturedOp == .le) ? .be : capturedCC
+                    ctx.instrs.append(.xmmCmp(sz, src: .reg(rReg), dst: lReg))
                     ctx.instrs.append(.setcc(floatCC, dst))
                     // NaN handling: ucomisd sets PF=1 for unordered (NaN).
                     // C semantics: NaN comparisons return false (eq/lt/le) or
                     // true (ne). Adjust by checking parity flag.
-                    if capturedOp == .ne {
+                    if isNeParity {
                         // ne: unordered counts as not-equal → OR with setp
                         let p = ctx.freshVirtual()
                         ctx.instrs.append(.setcc(.p, p))
@@ -808,8 +828,8 @@ func buildPatternTable() -> [ISelPattern] {
                     ctx.instrs.append(.cmpRmiR(.cmp, sz, src: r, dst: lReg))
                     // Use unsigned condition codes (b/be) for unsigned or pointer types
                     let intCC: CondCode
-                    if !isMachineSigned(operandType) && (capturedOp == .lt || capturedOp == .le) {
-                        intCC = (capturedOp == .lt) ? .b : .be
+                    if !isMachineSigned(operandType), let uCC = unsignedCC {
+                        intCC = uCC
                     } else {
                         intCC = capturedCC
                     }
@@ -827,6 +847,7 @@ func buildPatternTable() -> [ISelPattern] {
     for (op, name): (BinaryOp, String) in [(.add, "fadd"), (.sub, "fsub"),
                                              (.mul, "fmul"), (.div, "fdiv")] {
         let capturedOp = op
+        let sseOp = op.sseOp!
         patterns.append(ISelPattern(
             name: name,
             cost: 4,
@@ -838,23 +859,11 @@ func buildPatternTable() -> [ISelPattern] {
             consumedChildren: { _ in [] },
             emit: { node, ctx in
                 let sz = sizeOf(node.type)
-                let isSingle = sz == .single
                 let l = nodeOperand(node.operands[0], ctx: &ctx)
                 let r = nodeOperand(node.operands[1], ctx: &ctx)
                 let dst = ctx.freshVirtual()
-                ctx.instrs.append(isSingle ? .xmmMov(.single, src: l, dst: .reg(dst))
-                                           : .xmmMov(.double_, src: l, dst: .reg(dst)))
-                switch capturedOp {
-                case .add: ctx.instrs.append(isSingle ? .xmmRmR(.add, .single, src: r, dst: dst)
-                                                      : .xmmRmR(.add, .double_, src: r, dst: dst))
-                case .sub: ctx.instrs.append(isSingle ? .xmmRmR(.sub, .single, src: r, dst: dst)
-                                                      : .xmmRmR(.sub, .double_, src: r, dst: dst))
-                case .mul: ctx.instrs.append(isSingle ? .xmmRmR(.mul, .single, src: r, dst: dst)
-                                                      : .xmmRmR(.mul, .double_, src: r, dst: dst))
-                case .div: ctx.instrs.append(isSingle ? .xmmRmR(.div, .single, src: r, dst: dst)
-                                                      : .xmmRmR(.div, .double_, src: r, dst: dst))
-                default: break
-                }
+                ctx.instrs.append(.xmmMov(sz, src: l, dst: .reg(dst)))
+                ctx.instrs.append(.xmmRmR(sseOp, sz, src: r, dst: dst))
                 return .reg(dst)
             }
         ))
@@ -876,16 +885,10 @@ func buildPatternTable() -> [ISelPattern] {
             let dst = ctx.freshVirtual()
             if isFloat(node.type) {
                 // Float negation: 0.0 - x
-                let zeroOp = materializeFloat(0.0,
-                    type: sz == .single ? .float : .double, ctx: &ctx)
+                let zeroOp = materializeFloat(0.0, type: floatType(for: sz), ctx: &ctx)
                 let zeroReg = ensureReg(zeroOp, size: sz, ctx: &ctx)
-                if sz == .single {
-                    ctx.instrs.append(.xmmMovRR(.single, src: zeroReg, dst: dst))
-                    ctx.instrs.append(.xmmRmR(.sub, .single, src: src, dst: dst))
-                } else {
-                    ctx.instrs.append(.xmmMovRR(.double_, src: zeroReg, dst: dst))
-                    ctx.instrs.append(.xmmRmR(.sub, .double_, src: src, dst: dst))
-                }
+                ctx.instrs.append(.xmmMovRR(sz, src: zeroReg, dst: dst))
+                ctx.instrs.append(.xmmRmR(.sub, sz, src: src, dst: dst))
             } else {
                 ctx.instrs.append(.mov(sz, src: src, dst: .reg(dst)))
                 ctx.instrs.append(.unaryRm(.neg, sz, dst))
@@ -926,37 +929,18 @@ func buildPatternTable() -> [ISelPattern] {
             let sz = sizeOf(node.type)
             let addr = nodeOperand(node.operands[0], ctx: &ctx)
             let dst = ctx.freshVirtual()
+            let fl = isFloat(node.type)
             if case .reg(let base) = addr {
-                let mem = Memory(base: base)
-                if isFloat(node.type) {
-                    ctx.instrs.append(sz == .single
-                        ? .xmmMovMR(.single, src: mem, dst: dst)
-                        : .xmmMovMR(.double_, src: mem, dst: dst))
-                } else {
-                    ctx.instrs.append(.movMR(sz, src: mem, dst: dst))
-                }
+                emitLoad(sz: sz, from: Memory(base: base), to: dst, float: fl, ctx: &ctx)
             } else if case .mem(let mem) = addr {
                 if mem.isStack {
                     // Stack slot: the mem operand IS the address, load directly.
-                    if isFloat(node.type) {
-                        ctx.instrs.append(sz == .single
-                            ? .xmmMovMR(.single, src: mem, dst: dst)
-                            : .xmmMovMR(.double_, src: mem, dst: dst))
-                    } else {
-                        ctx.instrs.append(.movMR(sz, src: mem, dst: dst))
-                    }
+                    emitLoad(sz: sz, from: mem, to: dst, float: fl, ctx: &ctx)
                 } else {
                     // Global/other: load the pointer, then dereference.
                     let tmp = ctx.freshVirtual()
                     ctx.instrs.append(.movMR(.qword, src: mem, dst: tmp))
-                    let derefMem = Memory(base: tmp)
-                    if isFloat(node.type) {
-                        ctx.instrs.append(sz == .single
-                            ? .xmmMovMR(.single, src: derefMem, dst: dst)
-                            : .xmmMovMR(.double_, src: derefMem, dst: dst))
-                    } else {
-                        ctx.instrs.append(.movMR(sz, src: derefMem, dst: dst))
-                    }
+                    emitLoad(sz: sz, from: Memory(base: tmp), to: dst, float: fl, ctx: &ctx)
                 }
             }
             return .reg(dst)
@@ -976,47 +960,21 @@ func buildPatternTable() -> [ISelPattern] {
             let sz = sizeOf(valType)
             let addr = nodeOperand(node.operands[0], ctx: &ctx)
             let val = nodeOperand(node.operands[1], ctx: &ctx)
+            let fl = isFloat(valType)
             if case .reg(let base) = addr {
-                let mem = Memory(base: base)
-                if isFloat(valType) {
-                    let srcReg = ensureReg(val, size: sz, ctx: &ctx)
-                    ctx.instrs.append(sz == .single
-                        ? .xmmMovRM(.single, src: srcReg, dst: mem)
-                        : .xmmMovRM(.double_, src: srcReg, dst: mem))
-                } else {
-                    let src = ensureRegOrImm(val, size: sz, ctx: &ctx)
-                    ctx.instrs.append(.mov(sz, src: src, dst: .mem(mem)))
-                }
+                emitStore(sz: sz, val: val, to: Memory(base: base), float: fl, ctx: &ctx)
             } else if case .mem(let mem) = addr {
                 if mem.isStack {
                     // Stack slot: write directly to the memory operand.
-                    if isFloat(valType) {
-                        let srcReg = ensureReg(val, size: sz, ctx: &ctx)
-                        ctx.instrs.append(sz == .single
-                            ? .xmmMovRM(.single, src: srcReg, dst: mem)
-                            : .xmmMovRM(.double_, src: srcReg, dst: mem))
-                    } else {
-                        let src = ensureRegOrImm(val, size: sz, ctx: &ctx)
-                        ctx.instrs.append(.mov(sz, src: src, dst: .mem(mem)))
-                    }
+                    emitStore(sz: sz, val: val, to: mem, float: fl, ctx: &ctx)
                 } else if mem.symbol != nil && mem.base == nil {
                     // Global variable (RIP-relative): store directly.
-                    if isFloat(valType) {
-                        let srcReg = ensureReg(val, size: sz, ctx: &ctx)
-                        ctx.instrs.append(sz == .single
-                            ? .xmmMovRM(.single, src: srcReg, dst: mem)
-                            : .xmmMovRM(.double_, src: srcReg, dst: mem))
-                    } else {
-                        let src = ensureRegOrImm(val, size: sz, ctx: &ctx)
-                        ctx.instrs.append(.mov(sz, src: src, dst: .mem(mem)))
-                    }
+                    emitStore(sz: sz, val: val, to: mem, float: fl, ctx: &ctx)
                 } else {
                     // Other: load the pointer, then write through it.
                     let tmp = ctx.freshVirtual()
                     ctx.instrs.append(.movMR(.qword, src: mem, dst: tmp))
-                    let derefMem = Memory(base: tmp)
-                    let src = ensureRegOrImm(val, size: sz, ctx: &ctx)
-                    ctx.instrs.append(.mov(sz, src: src, dst: .mem(derefMem)))
+                    emitStore(sz: sz, val: val, to: Memory(base: tmp), float: fl, ctx: &ctx)
                 }
             }
             return nil
@@ -1112,16 +1070,11 @@ func buildPatternTable() -> [ISelPattern] {
             if case .bool = toType {
                 // Cast to _Bool: normalize to 0 or 1.
                 if fromFloat {
-                    // float/double → _Bool: xorpd zero, ucomisd, setne
+                    // float/double → _Bool: compare against 0.0, setne
                     let sReg = ensureReg(src, size: fromSz, ctx: &ctx)
-                    let zero = ctx.freshVirtual()
-                    let floatType: CType = fromSz == .single ? .float : .double
-                    let zeroImm = materializeFloat(0.0, type: floatType, ctx: &ctx)
-                    ctx.instrs.append(fromSz == .single
-                        ? .xmmCmp(.single, src: zeroImm, dst: sReg)
-                        : .xmmCmp(.double_, src: zeroImm, dst: sReg))
+                    let zeroImm = materializeFloat(0.0, type: floatType(for: fromSz), ctx: &ctx)
+                    ctx.instrs.append(.xmmCmp(fromSz, src: zeroImm, dst: sReg))
                     ctx.instrs.append(.setcc(.ne, dst))
-                    _ = zero  // unused, zero materialized via helper
                 } else if case .imm(let val) = src {
                     ctx.instrs.append(.movIR(.byte, imm: val != 0 ? 1 : 0, dst: dst))
                 } else {
@@ -1132,9 +1085,7 @@ func buildPatternTable() -> [ISelPattern] {
             } else if fromFloat && toFloat {
                 if fromSz == toSz {
                     // Same float type — just move.
-                    ctx.instrs.append(fromSz == .single
-                        ? .xmmMov(.single, src: src, dst: .reg(dst))
-                        : .xmmMov(.double_, src: src, dst: .reg(dst)))
+                    ctx.instrs.append(.xmmMov(fromSz, src: src, dst: .reg(dst)))
                 } else {
                     let sReg = ensureReg(src, size: fromSz, ctx: &ctx)
                     ctx.instrs.append(.cvt(from: fromSz, to: toSz, src: .reg(sReg), dst: dst))
@@ -1176,17 +1127,10 @@ func buildPatternTable() -> [ISelPattern] {
                     ctx.instrs.append(.cvt(from: .qword, to: toSz, src: .reg(lo), dst: loF))
                     // Multiply high part by 2^32.
                     let scale = materializeFloat(4294967296.0,
-                                                 type: toSz == .single ? .float : .double,
-                                                 ctx: &ctx)
-                    if toSz == .single {
-                        ctx.instrs.append(.xmmRmR(.mul, .single, src: scale, dst: hiF))
-                        ctx.instrs.append(.xmmRmR(.add, .single, src: .reg(loF), dst: hiF))
-                        ctx.instrs.append(.xmmMovRR(.single, src: hiF, dst: dst))
-                    } else {
-                        ctx.instrs.append(.xmmRmR(.mul, .double_, src: scale, dst: hiF))
-                        ctx.instrs.append(.xmmRmR(.add, .double_, src: .reg(loF), dst: hiF))
-                        ctx.instrs.append(.xmmMovRR(.double_, src: hiF, dst: dst))
-                    }
+                                                 type: floatType(for: toSz), ctx: &ctx)
+                    ctx.instrs.append(.xmmRmR(.mul, toSz, src: scale, dst: hiF))
+                    ctx.instrs.append(.xmmRmR(.add, toSz, src: .reg(loF), dst: hiF))
+                    ctx.instrs.append(.xmmMovRR(toSz, src: hiF, dst: dst))
                 } else {
                     ctx.instrs.append(.cvt(from: actualFromSz, to: toSz, src: .reg(sReg), dst: dst))
                 }
@@ -1370,10 +1314,8 @@ func buildPatternTable() -> [ISelPattern] {
             // Emit parallel copy for register args
             if regCopies.count == 1 {
                 let c = regCopies[0]
-                if c.sz == .single {
-                    ctx.instrs.append(.xmmMov(.single, src: c.src, dst: c.dst))
-                } else if c.sz == .double_ {
-                    ctx.instrs.append(.xmmMov(.double_, src: c.src, dst: c.dst))
+                if c.sz == .single || c.sz == .double_ {
+                    ctx.instrs.append(.xmmMov(c.sz, src: c.src, dst: c.dst))
                 } else {
                     ctx.instrs.append(.mov(c.sz, src: c.src, dst: c.dst))
                 }
@@ -1393,9 +1335,7 @@ func buildPatternTable() -> [ISelPattern] {
                 if sz == .single || sz == .double_ {
                     // Can't push XMM registers; use sub+mov instead.
                     ctx.instrs.append(.aluRmiR(.sub, .qword, src: .imm(8), dst: .physical(.rsp)))
-                    ctx.instrs.append(sz == .single
-                        ? .xmmMov(.single, src: a, dst: .mem(Memory(base: .physical(.rsp), displacement: 0)))
-                        : .xmmMov(.double_, src: a, dst: .mem(Memory(base: .physical(.rsp), displacement: 0))))
+                    ctx.instrs.append(.xmmMov(sz, src: a, dst: .mem(Memory(base: .physical(.rsp), displacement: 0))))
                 } else {
                     ctx.instrs.append(.push(.qword, a))
                 }
@@ -1446,9 +1386,7 @@ func buildPatternTable() -> [ISelPattern] {
                 let dst = ctx.freshVirtual()
                 let sz = sizeOf(node.type)
                 if isFloat(node.type) {
-                    ctx.instrs.append(sz == .single
-                        ? .xmmMovRR(.single, src: .physical(.xmm0), dst: dst)
-                        : .xmmMovRR(.double_, src: .physical(.xmm0), dst: dst))
+                    ctx.instrs.append(.xmmMovRR(sz, src: .physical(.xmm0), dst: dst))
                 } else {
                     ctx.instrs.append(.movRR(sz, src: .physical(.rax), dst: dst))
                 }
@@ -1475,9 +1413,7 @@ func buildPatternTable() -> [ISelPattern] {
             if isFloat(lhsType) {
                 let lReg = ensureReg(l, size: sz, ctx: &ctx)
                 let rReg = ensureReg(r, size: sz, ctx: &ctx)
-                ctx.instrs.append(sz == .single
-                    ? .xmmCmp(.single, src: .reg(rReg), dst: lReg)
-                    : .xmmCmp(.double_, src: .reg(rReg), dst: lReg))
+                ctx.instrs.append(.xmmCmp(sz, src: .reg(rReg), dst: lReg))
             } else {
                 let lReg = ensureReg(l, size: sz, ctx: &ctx)
                 ctx.instrs.append(.cmpRmiR(.cmp, sz, src: r, dst: lReg))
@@ -1501,12 +1437,9 @@ func buildPatternTable() -> [ISelPattern] {
             if isFloat(type) {
                 // Float test: compare against zero. Materialize 0.0 and compare.
                 let reg = ensureReg(op, size: sz, ctx: &ctx)
-                let zeroConst = materializeFloat(0.0,
-                    type: sz == .single ? .float : .double, ctx: &ctx)
+                let zeroConst = materializeFloat(0.0, type: floatType(for: sz), ctx: &ctx)
                 let zeroReg = ensureReg(zeroConst, size: sz, ctx: &ctx)
-                ctx.instrs.append(sz == .single
-                    ? .xmmCmp(.single, src: .reg(zeroReg), dst: reg)
-                    : .xmmCmp(.double_, src: .reg(zeroReg), dst: reg))
+                ctx.instrs.append(.xmmCmp(sz, src: .reg(zeroReg), dst: reg))
             } else {
                 let reg = ensureReg(op, size: sz, ctx: &ctx)
                 ctx.instrs.append(.cmpRmiR(.test, sz, src: .reg(reg), dst: reg))
@@ -1614,101 +1547,24 @@ func buildPatternTable() -> [ISelPattern] {
                 isMemZero = false
             }
 
-            let srcReg: Reg
+            let srcReg: Reg?
             if isMemZero {
-                // Use a zero register for stores.
-                srcReg = ctx.freshVirtual()  // not actually used as address
+                srcReg = nil
             } else {
                 // Get ADDRESS of src. If the emitted operand is a memory reference
                 // (e.g. from a call returning a struct), use lea to get its address
                 // instead of mov which would load the value.
                 let srcOp = nodeOperand(node.operands[1], ctx: &ctx)
                 if case .mem(let m) = srcOp {
-                    srcReg = ctx.freshVirtual()
-                    ctx.instrs.append(.lea(.qword, src: m, dst: srcReg))
+                    let r = ctx.freshVirtual()
+                    ctx.instrs.append(.lea(.qword, src: m, dst: r))
+                    srcReg = r
                 } else {
                     srcReg = ensureReg(srcOp, size: .qword, ctx: &ctx)
                 }
             }
 
-            // Emit qword copies for bulk, then handle remainder.
-            var offset: Int32 = 0
-            var remaining = size
-            if isMemZero {
-                // Zero-fill: write zeros directly to destination.
-                let zeroReg = ctx.freshVirtual()
-                ctx.instrs.append(.movIR(.qword, imm: 0, dst: zeroReg))
-                while remaining >= 8 {
-                    ctx.instrs.append(.movRM(.qword,
-                        src: zeroReg,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                    offset += 8
-                    remaining -= 8
-                }
-                if remaining >= 4 {
-                    ctx.instrs.append(.movRM(.dword,
-                        src: zeroReg,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                    offset += 4
-                    remaining -= 4
-                }
-                if remaining >= 2 {
-                    ctx.instrs.append(.movRM(.word,
-                        src: zeroReg,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                    offset += 2
-                    remaining -= 2
-                }
-                if remaining >= 1 {
-                    ctx.instrs.append(.movRM(.byte,
-                        src: zeroReg,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                }
-            } else {
-                // Normal copy: load from src, store to dst.
-                while remaining >= 8 {
-                    let tmp = ctx.freshVirtual()
-                    ctx.instrs.append(.movMR(.qword,
-                        src: Memory(base: srcReg, displacement: offset),
-                        dst: tmp))
-                    ctx.instrs.append(.movRM(.qword,
-                        src: tmp,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                    offset += 8
-                    remaining -= 8
-                }
-                if remaining >= 4 {
-                    let tmp = ctx.freshVirtual()
-                    ctx.instrs.append(.movMR(.dword,
-                        src: Memory(base: srcReg, displacement: offset),
-                        dst: tmp))
-                    ctx.instrs.append(.movRM(.dword,
-                        src: tmp,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                    offset += 4
-                    remaining -= 4
-                }
-                if remaining >= 2 {
-                    let tmp = ctx.freshVirtual()
-                    ctx.instrs.append(.movMR(.word,
-                        src: Memory(base: srcReg, displacement: offset),
-                        dst: tmp))
-                    ctx.instrs.append(.movRM(.word,
-                        src: tmp,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                    offset += 2
-                    remaining -= 2
-                }
-                if remaining >= 1 {
-                    let tmp = ctx.freshVirtual()
-                    ctx.instrs.append(.movMR(.byte,
-                        src: Memory(base: srcReg, displacement: offset),
-                        dst: tmp))
-                    ctx.instrs.append(.movRM(.byte,
-                        src: tmp,
-                        dst: Memory(base: dstReg, displacement: offset)))
-                }
-            }
+            emitBlockTransfer(to: dstReg, from: srcReg, size: size, ctx: &ctx)
             return nil
         }
     ))

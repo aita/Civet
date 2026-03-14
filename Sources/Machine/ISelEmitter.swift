@@ -345,61 +345,24 @@ public struct InstructionSelector {
                     let structSz = typeSize(f.returnType)
 
                     // Get struct address (return value is a struct variable → its address)
-                    let structOp: Operand
-                    if case .variable(_, let id, _) = value, let node = builder.lookupDef(id) {
-                        structOp = emitNode(node, ctx: &ctx) ?? nodeOperandDirect(value, ctx: &ctx)
-                    } else {
-                        structOp = nodeOperandDirect(value, ctx: &ctx)
-                    }
+                    let structOp = resolveOperand(value, builder: builder, ctx: &ctx)
 
                     if abi.isMemory {
                         // MEMORY class: copy struct to return buffer.
                         // The buffer address was saved at function entry to retBufSlot.
                         guard let bufSlot = retBufSlot else { break }
                         // Get struct source address
-                        let srcAddr: Reg
-                        if case .mem(let mem) = structOp {
-                            let tmp = ctx.freshVirtual()
-                            ctx.instrs.append(.lea(.qword, src: mem, dst: tmp))
-                            srcAddr = tmp
-                        } else {
-                            let tmp = ctx.freshVirtual()
-                            ctx.instrs.append(.mov(.qword, src: structOp, dst: .reg(tmp)))
-                            srcAddr = tmp
-                        }
+                        let srcAddr = structAddrReg(structOp, ctx: &ctx)
                         // Load buffer address
                         let bufAddr = ctx.freshVirtual()
                         ctx.instrs.append(.movMR(.qword, src: .stack(bufSlot), dst: bufAddr))
-                        // Copy struct qwords from source to buffer
-                        let qwords = (structSz + 7) / 8
-                        let scratch = ctx.freshVirtual()
-                        for qi in 0..<qwords {
-                            let off = Int32(qi * 8)
-                            let remaining = structSz - qi * 8
-                            let ldSz: Size = remaining >= 8 ? .qword : (remaining >= 4 ? .dword : (remaining >= 2 ? .word : .byte))
-                            ctx.instrs.append(.movMR(ldSz,
-                                src: Memory(base: srcAddr, displacement: off),
-                                dst: scratch))
-                            ctx.instrs.append(.movRM(ldSz,
-                                src: scratch,
-                                dst: Memory(base: bufAddr, displacement: off)))
-                        }
+                        // Copy struct from source to buffer
+                        emitBlockTransfer(to: bufAddr, from: srcAddr, size: structSz, ctx: &ctx)
                         // Return the buffer address in rax
                         ctx.instrs.append(.movRR(.qword, src: bufAddr, dst: .physical(.rax)))
                     } else {
                         // Small struct: load eightbytes into return registers.
-                        let structAddr: Reg
-                        if case .mem(let mem) = structOp {
-                            // Stack location - compute address
-                            let tmp = ctx.freshVirtual()
-                            ctx.instrs.append(.lea(.qword, src: mem, dst: tmp))
-                            structAddr = tmp
-                        } else {
-                            // Already an address in a register
-                            let tmp = ctx.freshVirtual()
-                            ctx.instrs.append(.mov(.qword, src: structOp, dst: .reg(tmp)))
-                            structAddr = tmp
-                        }
+                        let structAddr = structAddrReg(structOp, ctx: &ctx)
 
                         var retIntIdx = 0
                         var retSseIdx = 0
@@ -423,15 +386,9 @@ public struct InstructionSelector {
                     }
                 } else {
                     let sz = Size.from(f.returnType)
-                    let op: Operand
-                    if case .variable(_, let id, _) = value, let node = builder.lookupDef(id) {
-                        op = emitNode(node, ctx: &ctx) ?? nodeOperandDirect(value, ctx: &ctx)
-                    } else {
-                        op = nodeOperandDirect(value, ctx: &ctx)
-                    }
+                    let op = resolveOperand(value, builder: builder, ctx: &ctx)
                     if isFloat(f.returnType) {
-                        let xmmSz: Size = sz == .single ? .single : .double_
-                        ctx.instrs.append(.xmmMov(xmmSz, src: op, dst: .reg(.physical(.xmm0))))
+                        ctx.instrs.append(.xmmMov(sz, src: op, dst: .reg(.physical(.xmm0))))
                     } else {
                         ctx.instrs.append(.mov(sz, src: op, dst: .reg(.physical(.rax))))
                     }
@@ -440,12 +397,7 @@ public struct InstructionSelector {
             ctx.instrs.append(.jmp("epilogue"))
 
         case .computedGoto(let value):
-            let cgOp: Operand
-            if case .variable(_, let id, _) = value, let node = builder.lookupDef(id) {
-                cgOp = emitNode(node, ctx: &ctx) ?? nodeOperandDirect(value, ctx: &ctx)
-            } else {
-                cgOp = nodeOperandDirect(value, ctx: &ctx)
-            }
+            let cgOp = resolveOperand(value, builder: builder, ctx: &ctx)
             if case .reg(let r) = cgOp {
                 ctx.instrs.append(.jmpIndirect(r))
             } else {
@@ -453,6 +405,28 @@ public struct InstructionSelector {
                 ctx.instrs.append(.mov(.qword, src: cgOp, dst: .reg(tmp)))
                 ctx.instrs.append(.jmpIndirect(tmp))
             }
+        }
+    }
+
+    /// Resolve a COIL operand to a machine operand, preferring the DAG's emitted result.
+    private func resolveOperand(_ value: COIL.Operand, builder: DAGBuilder,
+                                ctx: inout ISelContext) -> Operand {
+        if case .variable(_, let id, _) = value, let node = builder.lookupDef(id) {
+            return emitNode(node, ctx: &ctx) ?? nodeOperandDirect(value, ctx: &ctx)
+        }
+        return nodeOperandDirect(value, ctx: &ctx)
+    }
+
+    /// Get the address register from a struct operand (which may be .mem or .reg).
+    private func structAddrReg(_ structOp: Operand, ctx: inout ISelContext) -> Reg {
+        if case .mem(let mem) = structOp {
+            let tmp = ctx.freshVirtual()
+            ctx.instrs.append(.lea(.qword, src: mem, dst: tmp))
+            return tmp
+        } else {
+            let tmp = ctx.freshVirtual()
+            ctx.instrs.append(.mov(.qword, src: structOp, dst: .reg(tmp)))
+            return tmp
         }
     }
 
@@ -611,16 +585,12 @@ public struct InstructionSelector {
                     if sseIdx < PhysReg.sseArgRegs.count {
                         let src = PhysReg.sseArgRegs[sseIdx]; sseIdx += 1
                         if let dst = varMap[id] {
-                            instrs.append(sz == .single
-                                ? .xmmMovRR(.single, src: .physical(src), dst: dst)
-                                : .xmmMovRR(.double_, src: .physical(src), dst: dst))
+                            instrs.append(.xmmMovRR(sz, src: .physical(src), dst: dst))
                         }
                     } else {
                         if let dst = varMap[id] {
                             let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
-                            instrs.append(sz == .single
-                                ? .xmmMovMR(.single, src: mem, dst: dst)
-                                : .xmmMovMR(.double_, src: mem, dst: dst))
+                            instrs.append(.xmmMovMR(sz, src: mem, dst: dst))
                         }
                         stackArgOffset += 8
                     }
@@ -648,16 +618,12 @@ public struct InstructionSelector {
                         let src = PhysReg.sseArgRegs[sseIdx]; sseIdx += 1
                         currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
                         let slot = currentStackOffset
-                        instrs.append(sz == .single
-                            ? .xmmMovRM(.single, src: .physical(src), dst: .stack(slot))
-                            : .xmmMovRM(.double_, src: .physical(src), dst: .stack(slot)))
+                        instrs.append(.xmmMovRM(sz, src: .physical(src), dst: .stack(slot)))
                         paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: true, spillSlot: slot))
                     } else {
                         let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
                         if let dst = varMap[id] {
-                            instrs.append(sz == .single
-                                ? .xmmMovMR(.single, src: mem, dst: dst)
-                                : .xmmMovMR(.double_, src: mem, dst: dst))
+                            instrs.append(.xmmMovMR(sz, src: mem, dst: dst))
                         }
                         stackArgOffset += 8
                     }
@@ -684,9 +650,7 @@ public struct InstructionSelector {
         for info in paramInfos {
             if let dst = varMap[info.id] {
                 if info.isFloat {
-                    instrs.append(info.sz == .single
-                        ? .xmmMovMR(.single, src: .stack(info.spillSlot), dst: dst)
-                        : .xmmMovMR(.double_, src: .stack(info.spillSlot), dst: dst))
+                    instrs.append(.xmmMovMR(info.sz, src: .stack(info.spillSlot), dst: dst))
                 } else {
                     instrs.append(.movMR(info.sz, src: .stack(info.spillSlot), dst: dst))
                 }
