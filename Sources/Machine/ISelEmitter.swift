@@ -87,7 +87,7 @@ public struct InstructionSelector {
 
             // Build DAG from COIL instructions
             var builder = DAGBuilder(varMap: varMap, stackSlots: stackSlots)
-            builder.build(instructions: block.instructions)
+            builder.build(instructions: block.instructions, blockLabel: block.label)
             builder.markLiveOuts(terminator: block.terminator)
 
             // Mark phi arguments in successor blocks as live-out.

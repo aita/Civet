@@ -1065,10 +1065,21 @@ func buildPatternTable() -> [ISelPattern] {
             // For struct/union base on stack or in memory: use lea to get address,
             // don't load the value (which would read struct data, not address).
             if case .mem(let mem) = base {
-                // Compute address = base_address + member_offset
-                let newMem = Memory(base: mem.base, index: mem.index, scale: mem.scale,
-                                    displacement: mem.displacement + mOffset, symbol: mem.symbol)
-                ctx.instrs.append(.lea(.qword, src: newMem, dst: dst))
+                // If the base is a global pointer (not a struct), we need to load
+                // the pointer value first, then add offset. Global struct bases
+                // (e.g. `s.field` where `s` is a global struct) use lea directly.
+                if !mem.isStack, case .pointer = node.operands[0].type {
+                    let tmp = ctx.freshVirtual()
+                    ctx.instrs.append(.movMR(.qword, src: mem, dst: tmp))
+                    ctx.instrs.append(.lea(.qword,
+                                           src: Memory(base: tmp, displacement: mOffset),
+                                           dst: dst))
+                } else {
+                    // Compute address = base_address + member_offset
+                    let newMem = Memory(base: mem.base, index: mem.index, scale: mem.scale,
+                                        displacement: mem.displacement + mOffset, symbol: mem.symbol)
+                    ctx.instrs.append(.lea(.qword, src: newMem, dst: dst))
+                }
             } else {
                 // Base is a register (pointer to struct): add member offset
                 let baseReg = ensureReg(base, size: .qword, ctx: &ctx)
@@ -1601,6 +1612,33 @@ func buildPatternTable() -> [ISelPattern] {
         }
     ))
 
+    // ── Alloca (dynamic stack allocation) ───────────────────────────
+
+    patterns.append(ISelPattern(
+        name: "alloca",
+        cost: 1,
+        match: { node in
+            if case .alloca = node.kind { return true }
+            return false
+        },
+        consumedChildren: { _ in [] },
+        emit: { node, ctx in
+            let sizeOp = nodeOperand(node.operands[0], ctx: &ctx)
+            let sizeReg = ensureReg(sizeOp, size: .qword, ctx: &ctx)
+            // Round up to 16-byte alignment: size = (size + 15) & ~15
+            let alignedSize = ctx.freshVirtual()
+            ctx.instrs.append(.movRR(.qword, src: sizeReg, dst: alignedSize))
+            ctx.instrs.append(.aluRmiR(.add, .qword, src: .imm(15), dst: alignedSize))
+            ctx.instrs.append(.aluRmiR(.and, .qword, src: .imm(-16), dst: alignedSize))
+            // sub alignedSize, %rsp
+            ctx.instrs.append(.aluRmiR(.sub, .qword, src: .reg(alignedSize), dst: .physical(.rsp)))
+            // result = rsp (pointer to allocated space)
+            let dst = ctx.freshVirtual()
+            ctx.instrs.append(.movRR(.qword, src: .physical(.rsp), dst: dst))
+            return .reg(dst)
+        }
+    ))
+
     return patterns
 }
 
@@ -1640,12 +1678,20 @@ func memberOffset(_ type: CType, name: String) -> Int32 {
 }
 
 private func computeMemberOffset(_ r: CRecordType, name: String) -> Int32 {
-    var offset = 0
-    for m in r.members {
-        let align = typeAlign(m.type)
-        offset = (offset + align - 1) / align * align
-        if m.name == name { return Int32(offset) }
-        offset += typeSize(m.type)
+    for m in r.members where m.name == name {
+        return Int32(m.offset)
+    }
+    // Recurse into anonymous struct/union members.
+    for m in r.members where m.name == nil {
+        switch m.type {
+        case .structType(let inner), .unionType(let inner):
+            let off = computeMemberOffset(inner, name: name)
+            if off != 0 || inner.members.contains(where: { $0.name == name }) {
+                return off
+            }
+        default:
+            break
+        }
     }
     return 0
 }

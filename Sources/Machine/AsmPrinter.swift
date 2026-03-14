@@ -62,11 +62,11 @@ public struct AsmPrinter {
             out += "\(g.name):\n"
 
             // Try to emit as a NUL-terminated string if the data looks like one
-            if isNulTerminatedString(data) {
+            if g.relocations.isEmpty && isNulTerminatedString(data) {
                 let str = String(data.dropLast().map { Character(UnicodeScalar($0)) })
                 out += "    .asciz \"\(escapeString(str))\"\n"
             } else {
-                emitDataBytes(data, into: &out)
+                emitDataBytes(data, relocations: g.relocations, into: &out)
             }
         } else {
             // BSS (zero-initialized)
@@ -351,22 +351,47 @@ public struct AsmPrinter {
         return out
     }
 
-    private func emitDataBytes(_ data: [UInt8], into out: inout String) {
+    private func emitDataBytes(_ data: [UInt8], relocations: [GlobalRelocation] = [], into out: inout String) {
+        // Build a set of relocation offsets for quick lookup.
+        var relocMap: [Int: GlobalRelocation] = [:]
+        for r in relocations {
+            relocMap[r.offset] = r
+        }
+
         var i = 0
         while i < data.count {
+            // Check if there's a relocation at this offset (always 8 bytes / .quad).
+            if let r = relocMap[i] {
+                if r.addend != 0 {
+                    out += "    .quad \(r.label)+\(r.addend)\n"
+                } else {
+                    out += "    .quad \(r.label)\n"
+                }
+                i += 8
+                continue
+            }
+
             let remaining = data.count - i
-            if remaining >= 8 {
+            // Don't emit a .quad that would overlap a relocation.
+            let nextReloc = relocations.first { $0.offset > i && $0.offset < i + 8 }
+            if remaining >= 8 && nextReloc == nil {
                 let val = data[i..<i+8].enumerated().reduce(UInt64(0)) {
                     $0 | (UInt64($1.element) << ($1.offset * 8))
                 }
                 out += "    .quad \(Int64(bitPattern: val))\n"
                 i += 8
             } else if remaining >= 4 {
-                let val = data[i..<i+4].enumerated().reduce(UInt32(0)) {
-                    $0 | (UInt32($1.element) << ($1.offset * 8))
+                let nextReloc4 = relocations.first { $0.offset > i && $0.offset < i + 4 }
+                if nextReloc4 == nil {
+                    let val = data[i..<i+4].enumerated().reduce(UInt32(0)) {
+                        $0 | (UInt32($1.element) << ($1.offset * 8))
+                    }
+                    out += "    .long \(Int32(bitPattern: val))\n"
+                    i += 4
+                } else {
+                    out += "    .byte \(data[i])\n"
+                    i += 1
                 }
-                out += "    .long \(Int32(bitPattern: val))\n"
-                i += 4
             } else {
                 out += "    .byte \(data[i])\n"
                 i += 1

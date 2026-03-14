@@ -45,7 +45,14 @@ public struct COILConverter {
         globals.append(contentsOf: floatGlobals)
 
         // Remove unreferenced static globals (e.g. unused __func__ strings)
-        let referenced = referencedSymbols(in: functions)
+        var referenced = referencedSymbols(in: functions)
+        // Also collect symbols referenced by global variable relocations
+        // (e.g. compound literal globals referenced through pointer initializers).
+        for g in globals {
+            for r in g.relocations {
+                referenced.insert(r.label)
+            }
+        }
         globals.removeAll { $0.isStatic && !referenced.contains($0.name) }
 
         return Program(functions: functions, globals: globals)
@@ -131,24 +138,27 @@ public struct COILConverter {
         // Skip function declarations — they are not data globals
         if case .function = v.type { return false }
         // Only emit definitions
-        if case .global(_, _, let isDef, _, _) = v.storage { return isDef }
+        if case .global(_, _, let isDef, _, _, _) = v.storage { return isDef }
         return false
     }
 
     private mutating func lowerGlobalVar(_ v: CVar) -> GlobalVar {
         let size = typeSize(v.type)
-        let align = max(typeAlign(v.type), 1)
+        let align = max(v.align ?? typeAlign(v.type), 1)
         var initData: [UInt8]? = nil
         var isStatic = false
         var isTentative = false
-        if case .global(let stat, _, _, let tent, let data) = v.storage {
+        var relocations: [GlobalRelocation] = []
+        if case .global(let stat, _, _, let tent, let data, let relocs) = v.storage {
             isStatic = stat
             isTentative = tent
             initData = data
+            relocations = relocs.map { GlobalRelocation(offset: $0.offset, label: $0.label, addend: $0.addend) }
         }
         let name = v.name
         return GlobalVar(name: name, size: size, alignment: align,
-                         initData: initData, isStatic: isStatic,
+                         initData: initData, relocations: relocations,
+                         isStatic: isStatic,
                          isTentative: isTentative)
     }
 
@@ -184,7 +194,9 @@ public struct COILConverter {
         for v in allVars {
             guard case .local(let id) = v.storage else { continue }
             let size = max(Int32(typeSize(v.type)), 1)
-            let align = max(Int32(typeAlign(v.type)), 1)
+            var align = max(Int32(v.align ?? typeAlign(v.type)), 1)
+            // GCC/System V convention: arrays ≥ 16 bytes are 16-byte aligned.
+            if case .array = v.type, size >= 16 { align = max(align, 16) }
             tempOffset = alignUp(tempOffset + size, to: align)
             precomputedOffsets[id] = tempOffset
         }

@@ -532,21 +532,40 @@ public struct Function: Sendable {
 }
 
 /// A global variable with optional initial data.
+/// A relocation entry for a global variable's initializer data.
+public struct GlobalRelocation: Sendable {
+    /// Byte offset within the initData where the relocation applies.
+    public let offset: Int
+    /// Symbol name to reference.
+    public let label: String
+    /// Addend to add to the symbol address.
+    public let addend: Int64
+
+    public init(offset: Int, label: String, addend: Int64) {
+        self.offset = offset
+        self.label = label
+        self.addend = addend
+    }
+}
+
 public struct GlobalVar: Sendable {
     public let name: String
     public let size: Int
     public let alignment: Int
     public let initData: [UInt8]?
+    public let relocations: [GlobalRelocation]
     public let isStatic: Bool
     public let isTentative: Bool
 
     public init(name: String, size: Int, alignment: Int,
-                initData: [UInt8]? = nil, isStatic: Bool = false,
+                initData: [UInt8]? = nil, relocations: [GlobalRelocation] = [],
+                isStatic: Bool = false,
                 isTentative: Bool = false) {
         self.name = name
         self.size = size
         self.alignment = alignment
         self.initData = initData
+        self.relocations = relocations
         self.isStatic = isStatic
         self.isTentative = isTentative
     }

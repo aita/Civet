@@ -1149,9 +1149,15 @@ struct LinearScanAllocator {
                     }
 
                 case .epilogue:
-                    if stackAdj > 0 {
-                        expanded.append(.aluRmiR(.add, .qword, src: .imm(Int64(stackAdj)),
-                                                 dst: .physical(.rsp)))
+                    // Use RBP-based restore to handle alloca (dynamic RSP changes).
+                    // leaq -(N)(%rbp), %rsp  where N = calleeSaved.count * 8
+                    let calleeSaveSize = Int32(calleeSaved.count * 8)
+                    if calleeSaveSize > 0 {
+                        expanded.append(.lea(.qword,
+                            src: Memory(base: .physical(.rbp), displacement: -calleeSaveSize),
+                            dst: .physical(.rsp)))
+                    } else {
+                        expanded.append(.movRR(.qword, src: .physical(.rbp), dst: .physical(.rsp)))
                     }
                     for r in calleeSaved.reversed() {
                         expanded.append(.pop(.qword, .physical(r)))
