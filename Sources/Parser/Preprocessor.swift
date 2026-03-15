@@ -2,7 +2,6 @@
 // Ported from chibicc's preprocess.c.
 
 import Foundation
-import Common
 import Syntax
 
 // MARK: - Macro

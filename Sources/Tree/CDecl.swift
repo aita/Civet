@@ -1,4 +1,4 @@
-import Common
+import Syntax
 
 /// Root node of a parsed C translation unit.
 public struct CTranslationUnit: Sendable {

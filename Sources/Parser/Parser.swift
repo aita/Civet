@@ -2,7 +2,6 @@
 // Ported from chibicc's parse.c.
 // Produces SyntaxTranslationUnit directly (no intermediate AST).
 
-import Common
 import Foundation
 import Syntax
 

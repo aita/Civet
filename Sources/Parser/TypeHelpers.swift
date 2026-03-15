@@ -1,7 +1,6 @@
 // Type system helpers for the C parser.
 // Ported from chibicc's type.c.
 
-import Common
 import Syntax
 
 // MARK: - Shared type constants

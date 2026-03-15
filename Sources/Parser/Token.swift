@@ -1,7 +1,6 @@
 // Token types and cursor for the C parser.
 // Ported from chibicc's tokenize.c token structures.
 
-import Common
 import Syntax
 
 public enum TokenKind: Sendable {

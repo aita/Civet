@@ -1,6 +1,5 @@
 // Variable/typedef/tag scoping for the C parser.
 
-import Common
 import Syntax
 
 // MARK: - Variable info

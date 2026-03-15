@@ -6,38 +6,22 @@ import PackageDescription
 let package = Package(
     name: "Civet",
     targets: [
-        .target(
-            name: "ChibiCC",
-            cSettings: [
-                .headerSearchPath("include"),
-                .headerSearchPath("."),
-                .define("_POSIX_C_SOURCE", to: "200809L"),
-            ]
-        ),
-        .target(name: "Common"),
-        .target(
-            name: "Syntax",
-            dependencies: ["Common"]
-        ),
+        .target(name: "Syntax"),
         .target(
             name: "Parser",
-            dependencies: ["Common", "Syntax"]
+            dependencies: ["Syntax"]
         ),
         .target(
             name: "Tree",
-            dependencies: ["Common", "Syntax"]
+            dependencies: ["Syntax"]
         ),
         .target(
             name: "COIL",
-            dependencies: ["Common", "Tree"]
+            dependencies: ["Tree"]
         ),
         .target(
             name: "Machine",
             dependencies: ["COIL", "Tree"]
-        ),
-        .target(
-            name: "SyntaxMapper",
-            dependencies: ["ChibiCC", "Syntax"]
         ),
         .executableTarget(
             name: "Civet",
