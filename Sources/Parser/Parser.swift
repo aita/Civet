@@ -889,6 +889,22 @@ public class CParser {
         return (members, isFlexible)
     }
 
+    /// Skip balanced `(( ... ))` content inside `__attribute__`.
+    /// Handles nested parentheses and arbitrary tokens.
+    func skipAttributeParens() throws {
+        try cursor.skip("(")
+        try cursor.skip("(")
+        var depth = 0
+        while true {
+            if cursor.equal(")") && depth == 0 { break }
+            if cursor.consume("(") { depth += 1; continue }
+            if cursor.consume(")") { depth -= 1; continue }
+            _ = cursor.advance()
+        }
+        try cursor.skip(")")
+        try cursor.skip(")")
+    }
+
     func parseAttributes() throws -> (isPacked: Bool, align: Int?) {
         var isPacked = false
         var align: Int? = nil
@@ -896,23 +912,43 @@ public class CParser {
         while cursor.consume("__attribute__") {
             try cursor.skip("(")
             try cursor.skip("(")
-            var first = true
-            while !cursor.consume(")") {
-                if !first { try cursor.skip(",") }
-                first = false
+            var depth = 0
+            while true {
+                if cursor.equal(")") && depth == 0 { break }
+                if cursor.equal("(") { depth += 1; _ = cursor.advance(); continue }
+                if cursor.equal(")") { depth -= 1; _ = cursor.advance(); continue }
                 if cursor.consume("packed") {
                     isPacked = true
                 } else if cursor.consume("aligned") {
-                    try cursor.skip("(")
-                    align = Int(try constExpr())
-                    try cursor.skip(")")
+                    if cursor.consume("(") {
+                        align = Int(try constExpr())
+                        try cursor.skip(")")
+                    }
                 } else {
-                    _ = cursor.advance() // skip unknown
+                    _ = cursor.advance() // skip unknown attr tokens
                 }
             }
             try cursor.skip(")")
+            try cursor.skip(")")
         }
         return (isPacked, align)
+    }
+
+    /// Skip any `__attribute__((...))` and `__asm__("...")` sequences.
+    func skipAttributes() throws {
+        while cursor.equal("__attribute__") || cursor.equal("__asm__") {
+            if cursor.consume("__attribute__") {
+                try skipAttributeParens()
+            } else if cursor.consume("__asm__") {
+                try cursor.skip("(")
+                var depth = 1
+                while depth > 0 {
+                    if cursor.consume("(") { depth += 1 }
+                    else if cursor.consume(")") { depth -= 1 }
+                    else { _ = cursor.advance() }
+                }
+            }
+        }
     }
 
     // MARK: - Helper: consumeEnd (for initializer lists)
@@ -2984,6 +3020,9 @@ public class CParser {
 
         fn!.isRoot = !(fn!.isStatic && fn!.isInline)
 
+        // Skip trailing __attribute__ (e.g. __THROW, __nonnull, etc.)
+        try skipAttributes()
+
         // Forward declaration
         if cursor.consume(";") {
             let gvLoc = l
@@ -3143,6 +3182,9 @@ public class CParser {
             v.isTLS = attr.isTLS
             if attr.align > 0 { v.align = attr.align }
 
+            // Skip trailing __attribute__
+            try skipAttributes()
+
             if cursor.consume("=") {
                 try gvarInitializer(v)
             } else if !attr.isExtern && !attr.isTLS {
@@ -3162,6 +3204,7 @@ public class CParser {
             first = false
             let (ty, name) = try declarator(basety)
             guard let name = name else { throw error("typedef name omitted") }
+            try skipAttributes()
             pushVar(name, VarScope(typeDef: ty))
         }
     }

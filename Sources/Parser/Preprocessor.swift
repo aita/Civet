@@ -1295,6 +1295,9 @@ public class Preprocessor {
         defineObjMacro("__signed__", "signed")
         defineObjMacro("__inline__", "inline")
         defineObjMacro("__typeof__", "typeof")
+        defineObjMacro("__extension__", "")
+        defineObjMacro("__restrict__", "restrict")
+        defineObjMacro("__restrict", "restrict")
 
         defineObjMacro("__FLT_MIN__", "1.17549435e-38f")
         defineObjMacro("__FLT_MAX__", "3.40282347e+38f")
