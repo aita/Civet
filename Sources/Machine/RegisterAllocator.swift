@@ -415,7 +415,8 @@ struct LinearScanAllocator {
         // that fit entirely within a free range (no overlap with any active assignment).
         // Prioritize by spill weight (loop-heavy intervals benefit most from re-allocation).
         let spilledByWeight = sorted.indices
-            .filter { sorted[$0].reg == nil && sorted[$0].spillSlot != nil }
+            .filter { sorted[$0].reg == nil && sorted[$0].spillSlot != nil
+                      && !sharedSpillSlots.contains(sorted[$0].spillSlot!) }
             .sorted { sorted[$0].spillWeight > sorted[$1].spillWeight }
 
         for idx in spilledByWeight {
