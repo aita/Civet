@@ -617,12 +617,58 @@ public final class SyntaxConverter {
 
     /// `expr != 0`
     private func isNonZero(_ expr: CExpr) -> CExpr {
-        .binary(.ne, expr, .intLiteral(0, type: expr.type), type: .int(signed: true))
+        // If expr is already a comparison with non-float operands, use it directly.
+        if case .binary(let op, _, _, _) = expr, isComparisonOp(op),
+           !hasFloatOperands(expr) {
+            return expr
+        }
+        return .binary(.ne, expr, .intLiteral(0, type: expr.type), type: .int(signed: true))
     }
 
     /// `expr == 0`
     private func isZero(_ expr: CExpr) -> CExpr {
-        .binary(.eq, expr, .intLiteral(0, type: expr.type), type: .int(signed: true))
+        // If expr is already a comparison with non-float operands, negate it directly.
+        // This avoids materializing a bool and re-testing it.
+        if case .binary(let op, let lhs, let rhs, let ty) = expr, isComparisonOp(op),
+           !hasFloatOperands(expr) {
+            if let negated = negateComparison(op, lhs: lhs, rhs: rhs, type: ty) {
+                return negated
+            }
+        }
+        return .binary(.eq, expr, .intLiteral(0, type: expr.type), type: .int(signed: true))
+    }
+
+    /// Returns true if the binary op is a comparison.
+    private func isComparisonOp(_ op: BinaryOp) -> Bool {
+        switch op {
+        case .eq, .ne, .lt, .le: return true
+        default: return false
+        }
+    }
+
+    /// Returns true if the expression is a binary with float/double operands.
+    private func hasFloatOperands(_ expr: CExpr) -> Bool {
+        guard case .binary(_, let lhs, let rhs, _) = expr else { return false }
+        return isFloatType(lhs.type) || isFloatType(rhs.type)
+    }
+
+    private func isFloatType(_ ty: CType) -> Bool {
+        switch ty {
+        case .float, .double, .longDouble: return true
+        default: return false
+        }
+    }
+
+    /// Negate a comparison: eq<->ne, lt<->(swap le), le<->(swap lt).
+    /// Since we only have eq/ne/lt/le, negation of lt/le requires operand swap.
+    private func negateComparison(_ op: BinaryOp, lhs: CExpr, rhs: CExpr, type: CType) -> CExpr? {
+        switch op {
+        case .eq: return .binary(.ne, lhs, rhs, type: type)
+        case .ne: return .binary(.eq, lhs, rhs, type: type)
+        case .lt: return .binary(.le, rhs, lhs, type: type)  // !(a < b) = b <= a
+        case .le: return .binary(.lt, rhs, lhs, type: type)  // !(a <= b) = b < a
+        default: return nil
+        }
     }
 
     /// Prepends `pre` statements before `stmt`, flattening if possible.
