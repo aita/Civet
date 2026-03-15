@@ -138,11 +138,40 @@ def run_binary(bin_path):
         return -1, "TIMEOUT"
 
 
-def apply_filters(text, grep_pattern=None, head_n=None):
-    """Apply grep and head filters to output text."""
+def apply_filters(text, grep_pattern=None, head_n=None, tail_n=None,
+                   sed_pattern=None):
+    """Apply grep, sed, tail, and head filters to output text."""
     if grep_pattern:
         regex = re.compile(grep_pattern)
         text = "\n".join(line for line in text.splitlines() if regex.search(line))
+    if sed_pattern:
+        # Support s/pattern/replacement/ and s/pattern/replacement/g
+        m = re.match(r'^s(.)(.+?)\1(.*?)\1(g?)$', sed_pattern)
+        if m:
+            pat, repl, flags = m.group(2), m.group(3), m.group(4)
+            count = 0 if flags == 'g' else 1
+            text = "\n".join(
+                re.sub(pat, repl, line, count=count) for line in text.splitlines()
+            )
+        # Support /start/,/end/p — print lines between matching patterns
+        m2 = re.match(r'^/(.*?)/(,|,/)(.+?)/p$', sed_pattern)
+        if m2:
+            start_pat = re.compile(m2.group(1))
+            end_pat = re.compile(m2.group(3))
+            lines = text.splitlines()
+            result = []
+            inside = False
+            for line in lines:
+                if not inside and start_pat.search(line):
+                    inside = True
+                if inside:
+                    result.append(line)
+                    if end_pat.search(line):
+                        inside = False
+            text = "\n".join(result)
+    if tail_n and tail_n > 0:
+        lines = text.splitlines()
+        text = "\n".join(lines[-tail_n:])
     if head_n and head_n > 0:
         lines = text.splitlines()
         text = "\n".join(lines[:head_n])
@@ -194,20 +223,20 @@ def cmd_run(args):
         ok, stdout, stderr = compile_c(c_path, asm_path, civet_args)
 
         if args.stderr or not ok:
-            filtered = apply_filters(stderr, args.grep if not args.asm else None, args.head)
+            filtered = apply_filters(stderr, args.grep if not args.asm else None, args.head, args.tail, args.sed)
             if filtered:
                 print(filtered, file=sys.stderr)
             if not ok:
                 sys.exit(1)
 
         if args.dump_coil or args.dump_ssa or args.dump_opt:
-            filtered = apply_filters(stderr, args.grep, args.head)
+            filtered = apply_filters(stderr, args.grep, args.head, args.tail, args.sed)
             if filtered:
                 print(filtered)
             return
 
         if args.asm:
-            filtered = apply_filters(stdout, args.grep, args.head)
+            filtered = apply_filters(stdout, args.grep, args.head, args.tail, args.sed)
             print(filtered)
             return
 
@@ -225,7 +254,7 @@ def cmd_run(args):
             sys.exit(1)
 
         code, output = run_binary(bin_path)
-        filtered = apply_filters(output, args.grep, args.head)
+        filtered = apply_filters(output, args.grep, args.head, args.tail, args.sed)
         if filtered:
             print(filtered)
         sys.exit(code)
@@ -363,7 +392,9 @@ def main():
     p_run.add_argument("--code", help="Inline C code to compile")
     p_run.add_argument("--asm", action="store_true", help="Print assembly only")
     p_run.add_argument("--grep", help="Filter output with regex")
-    p_run.add_argument("--head", type=int, help="Limit output to N lines")
+    p_run.add_argument("--head", type=int, help="Limit output to first N lines")
+    p_run.add_argument("--tail", type=int, help="Limit output to last N lines")
+    p_run.add_argument("--sed", help="Apply sed-like pattern (e.g. 's/foo/bar/g' or '/start/,/end/p')")
     p_run.add_argument("--dump-coil", action="store_const", const="--dump-coil",
                         help="Show COIL IR dump")
     p_run.add_argument("--dump-ssa", action="store_const", const="--dump-ssa",

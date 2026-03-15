@@ -276,18 +276,18 @@ public struct InstructionSelector {
     }
 
     /// Find variables defined in this block that are used in other blocks
-    /// via regular instructions or terminator operands (NOT phi args).
+    /// via regular instructions, terminator operands, or phi args.
     ///
-    /// Phi args are excluded here because `emitPhiCopies` handles them
-    /// directly using the node's `emittedOperand` (the actual register the
-    /// value was computed into). Including phi-arg-only variables here would
-    /// generate a redundant copy into the varMap register, producing two
-    /// moves per branch and defeating if-conversion.
+    /// Phi args whose predecessor IS this block are normally handled by
+    /// `collectPhiArgs` using the node's `emittedOperand`. However, if the
+    /// phi arg variable was defined in this block but DAG-aliased (e.g.,
+    /// `y = x` where x and y share the same DAG node), the `emittedOperand`
+    /// may write to x's vreg but not y's. Including phi args here ensures
+    /// the varMap register for y is also materialized.
     ///
-    /// Phi arg variables whose node has no `emittedOperand` (inlined constant)
-    /// are handled by `emitPhiCopies` falling back to `nodeOperandDirect`,
-    /// which reads the varMap register — but those variables are constants and
-    /// the varMap register is never needed for non-phi uses anyway.
+    /// Phi args whose predecessor is a DIFFERENT block must always be included:
+    /// `collectPhiArgs` at that other block falls back to `nodeOperandDirect`
+    /// which reads `varMap[id]`, so the defining block must materialize the value.
     private func computeCrossBlockUses(
         block: COIL.Block, coilFunction: COIL.Function,
         varMap: [Int: Reg]
@@ -309,10 +309,21 @@ public struct InstructionSelector {
                     result.append((vreg: reg, size: Size.from(type)))
                 }
             }
-            // Check instruction operands (not phi args — emitPhiCopies handles those)
+            // Check instruction operands
             for instr in otherBlock.instructions {
                 for op in instr.operands {
                     if case .variable(_, let id, let type) = op,
+                       defsInBlock.contains(id),
+                       let reg = varMap[id], seen.insert(id).inserted {
+                        result.append((vreg: reg, size: Size.from(type)))
+                    }
+                }
+            }
+            // Check phi args: variables defined here may flow through intermediate
+            // blocks to reach a phi, requiring the varMap register to be materialized.
+            for phi in otherBlock.phis {
+                for arg in phi.args {
+                    if case .variable(_, let id, let type) = arg.value,
                        defsInBlock.contains(id),
                        let reg = varMap[id], seen.insert(id).inserted {
                         result.append((vreg: reg, size: Size.from(type)))
