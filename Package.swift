@@ -29,8 +29,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CivetTests",
-            dependencies: ["Parser", "Tree", "COIL", "Machine"],
-            resources: [.copy("Fixtures")]
+            dependencies: ["Parser", "Tree", "COIL", "Machine"]
         ),
     ]
 )

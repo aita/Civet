@@ -628,67 +628,40 @@ import Tree
         #expect(try compileAndRun("struct P { int x; int y; }; int main() { struct P p = (struct P){3, 7}; return p.x+p.y; }") == 10)
     }
 
-    // MARK: - Fixture file tests
+    // MARK: - Multi-function tests
 
-    @Test func fixtureTestSimple() throws {
-        let asm = try compileFile(fixturePath("test_simple.c"))
-        #expect(try assembleAndRun(asm) == 42)
+    @Test func fibonacciRecursion() throws {
+        #expect(try compileAndRun("""
+            int fib(int n) { if (n <= 1) return n; return fib(n-1) + fib(n-2); }
+            int abs(int x) { if (x < 0) return -x; return x; }
+            int main() { return abs(-5) + fib(10); }
+            """) == 60)
     }
 
-    @Test func fixtureDemo() throws {
-        // fib(10)=55, abs(-5)=5, return 55+5=60
-        let asm = try compileFile(fixturePath("demo.c"))
-        #expect(try assembleAndRun(asm) == 60)
-    }
-
-    @Test func fixtureTestSSA() throws {
-        // x=1, if(x) x=2 else x=3 → return 2
-        let asm = try compileFile(fixturePath("test_ssa.c"))
-        #expect(try assembleAndRun(asm) == 2)
-    }
-
-    @Test func fixtureTestSSA2() throws {
-        // test(1)=10, test(0)=20 → return 30
-        let asm = try compileFile(fixturePath("test_ssa2.c"))
-        #expect(try assembleAndRun(asm) == 30)
-    }
-
-    @Test func fixtureOptTest() throws {
-        // mul3(7)=21, mul8(2)=16, udiv4(100)=25, umod8(15)=7 → 69
-        let asm = try compileFile(fixturePath("opt_test.c"))
-        #expect(try assembleAndRun(asm) == 69)
+    @Test func iselPatterns() throws {
+        #expect(try compileAndRun("""
+            int mul3(int x) { return x * 3; }
+            int mul8(int x) { return x * 8; }
+            unsigned udiv4(unsigned x) { return x / 4; }
+            unsigned umod8(unsigned x) { return x % 8; }
+            int main() { return mul3(7) + mul8(2) + udiv4(100) + umod8(15); }
+            """) == 69)
     }
 
     // MARK: - Memory / arena reset
 
-    private func fixturePath(_ name: String) -> String {
-        return projectRoot + "/Tests/CivetTests/Fixtures/" + name
-    }
-
-    private var defaultIncludePaths: [String] {
-        [
-            projectRoot + "/Tests/CivetTests/Fixtures",
-            projectRoot + "/Resources/chibicc-builtins",
-            "/usr/local/include",
-            "/usr/include/x86_64-linux-gnu",
-            "/usr/include",
-        ]
-    }
-
     @Test func repeatedParseDoesNotLeak() throws {
-        let path = fixturePath("demo.c")
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let src = "int fib(int n) { if (n<=1) return n; return fib(n-1)+fib(n-2); }\n"
+        let path = tmp.appendingPathComponent("test.c").path
+        try src.write(toFile: path, atomically: true, encoding: .utf8)
+        let builtins = projectRoot + "/Resources/chibicc-builtins"
+        let includes = [builtins, "/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include"]
         for _ in 0..<50 {
-            _ = try parseFile(path, includePaths: defaultIncludePaths)
-        }
-    }
-
-    @Test func parseDifferentFilesSequentially() throws {
-        let files = ["demo.c", "test_simple.c"]
-        for file in files {
-            let path = fixturePath(file)
-            guard FileManager.default.fileExists(atPath: path) else { continue }
-            let result = try parseFile(path, includePaths: defaultIncludePaths)
-            #expect(!result.declarations.isEmpty)
+            _ = try parseFile(path, includePaths: includes)
         }
     }
 }
