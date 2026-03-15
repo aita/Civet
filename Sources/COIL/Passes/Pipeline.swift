@@ -33,8 +33,9 @@ public func optimize(_ function: Function) -> Function {
 
 /// Run all optimization passes on every function in a program.
 public func optimize(_ program: Program) -> Program {
-    Program(
-        functions: program.functions.map { optimize($0) },
-        globals: program.globals
+    let inlined = inlineFunctions(program)
+    return Program(
+        functions: inlined.functions.map { optimize($0) },
+        globals: inlined.globals
     )
 }
