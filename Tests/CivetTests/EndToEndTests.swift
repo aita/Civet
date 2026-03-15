@@ -664,7 +664,7 @@ import Tree
     /// Compile a chibicc test `.c` file through Civet, compile `common` with gcc,
     /// link both, run, and return the exit code (0 = all ASSERT()s passed).
     private func compileAndRunChibiccTest(_ name: String) throws -> Int32 {
-        let chibiccDir = projectRoot + "/Tests/CivetTests/Fixtures/chibicc"
+        let chibiccDir = projectRoot + "/testdata/chibicc"
         let testPath = chibiccDir + "/" + name
         let commonPath = chibiccDir + "/common"
 

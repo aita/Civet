@@ -11,22 +11,35 @@ Civet is a C compiler written in Swift that compiles C source code to x86-64 ass
 ```bash
 swift build                    # Build (requires Swift 6.2+)
 swift build -c release         # Release build
+make build                     # Same as swift build
+make test                      # Run all tests (chibicc + swift)
 
+# Civet test tool (Python)
+python3 tools/civet-test chibicc                    # Run all 36 chibicc tests
+python3 tools/civet-test chibicc arith control      # Run specific chibicc tests
+python3 tools/civet-test chibicc --filter "str*"    # Filter by glob pattern
+python3 tools/civet-test run <file.c>               # Compile, link, run a C file
+python3 tools/civet-test run arith                  # Run by chibicc test name
+python3 tools/civet-test run <file> --asm           # Show assembly output only
+python3 tools/civet-test run <file> --asm --grep "mov.*rax"  # Grep assembly
+python3 tools/civet-test run --code 'int main(){return 42;}'  # Inline C code
+python3 tools/civet-test swift                      # Run Swift unit tests
+python3 tools/civet-test swift --filter EndToEndTests
+
+# Swift tests directly
 swift test                               # Run all Swift tests (175 tests)
 swift test --filter EndToEndTests        # Run only end-to-end tests
 swift test --filter "chibiccArith"       # Run a single test by name
-
-./test.sh                      # Run all chibicc test suite files (shell-based)
-./test.sh string enum          # Run specific chibicc tests
-./test.sh --inline             # Run inline snippet tests (Tests/run.sh)
-./t.sh <file.c>                # Quick single-file test
-./t.sh string                  # Quick test of chibicc test/string.c
-
-bash Tests/run.sh              # Full test suite (inline snippets + chibicc tests)
-bash Tests/run.sh --filter foo # Filter tests by name pattern
 ```
 
-Binary is output to `.build/debug/Civet`. Usage: `Civet <file.c>` outputs assembly to stdout.
+Binary is output to `.build/debug/Civet`.
+
+```bash
+Civet <file.c>              # Output assembly to stdout
+Civet <file.c> -o out       # Compile to binary (auto-discovers as/ld)
+Civet <file.c> -c -o out.o  # Assemble only (object file)
+Civet <file.c> -S -o out.s  # Write assembly to file
+```
 
 ## Compilation Pipeline
 
@@ -96,8 +109,8 @@ All optimization passes use `[Int: ...]` dictionaries keyed by variable ID.
 
 - Synthetic/temporary variables use negative IDs to distinguish from source-level variables
 - SSA versions created by `SSABuilder` use IDs `≤ -100_001` (offset from TreeConverter temps)
-- Chibicc test fixtures are at `Tests/CivetTests/Fixtures/chibicc/`
-- Tests link against `Fixtures/chibicc/common` which provides `assert()` and `printf` helpers
+- Chibicc test fixtures are at `testdata/chibicc/`
+- Tests link against `testdata/chibicc/common` which provides `assert()` and `printf` helpers
 - Stack layout preserves chibicc's pre-computed offsets (`CVar.stackOffset`)
 
 ## Test Status

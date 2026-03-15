@@ -337,10 +337,10 @@ int main() {
 
   ASSERT(1, __STDC__);
 
-  ASSERT(0, strcmp(main_filename1, "Tests/CivetTests/Fixtures/chibicc/macro.c"));
+  ASSERT(0, strcmp(main_filename1, "testdata/chibicc/macro.c"));
   ASSERT(5, main_line1);
   ASSERT(7, main_line2);
-  ASSERT(0, strcmp(include1_filename, "Tests/CivetTests/Fixtures/chibicc/include1.h"));
+  ASSERT(0, strcmp(include1_filename, "testdata/chibicc/include1.h"));
   ASSERT(4, include1_line);
 
 #define M14(...) 3
@@ -394,7 +394,7 @@ int main() {
 
   ASSERT(24, strlen(__TIMESTAMP__));
 
-  ASSERT(0, strcmp(__BASE_FILE__, "Tests/CivetTests/Fixtures/chibicc/macro.c"));
+  ASSERT(0, strcmp(__BASE_FILE__, "testdata/chibicc/macro.c"));
 
 #define M30(buf, fmt, ...) sprintf(buf, fmt __VA_OPT__(,) __VA_ARGS__)
   ASSERT(0, ({ char buf[100]; M30(buf, "foo"); strcmp(buf, "foo"); }));

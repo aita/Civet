@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Civet compiler test runner.
+
+Subcommands:
+  run       Compile, link, and run a single C file
+  chibicc   Run chibicc test suite
+  swift     Run Swift unit tests
+"""
+
+import argparse
+import fnmatch
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CIVET_BIN = os.path.join(PROJECT_ROOT, ".build", "debug", "Civet")
+TESTDATA_DIR = os.path.join(PROJECT_ROOT, "testdata", "chibicc")
+COMMON_SRC = os.path.join(TESTDATA_DIR, "common")
+
+CHIBICC_TESTS = [
+    "alignof", "alloca", "arith", "asm", "attribute", "bitfield",
+    "builtin", "cast", "commonsym", "complit", "compat", "const",
+    "constexpr", "control", "decl", "enum", "extern", "float",
+    "generic", "initializer", "literal", "macro", "offsetof",
+    "pointer", "sizeof", "stdhdr", "string", "struct", "typedef",
+    "typeof", "unicode", "union", "usualconv", "varargs", "variable", "vla",
+]
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+
+def _supports_color():
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+def green(s):
+    return f"\033[32m{s}\033[0m" if _supports_color() else s
+
+def red(s):
+    return f"\033[31m{s}\033[0m" if _supports_color() else s
+
+def bold(s):
+    return f"\033[1m{s}\033[0m" if _supports_color() else s
+
+# ---------------------------------------------------------------------------
+# Build management
+# ---------------------------------------------------------------------------
+
+def ensure_civet_built(no_build=False):
+    """Ensure Civet binary exists and is up-to-date."""
+    sources = glob.glob(os.path.join(PROJECT_ROOT, "Sources", "**", "*.swift"), recursive=True)
+    need_build = False
+
+    if not os.path.isfile(CIVET_BIN):
+        if no_build:
+            print("error: Civet binary not found. Run 'swift build' first.", file=sys.stderr)
+            sys.exit(1)
+        need_build = True
+    elif sources:
+        bin_mtime = os.path.getmtime(CIVET_BIN)
+        newest = max(os.path.getmtime(s) for s in sources)
+        if newest > bin_mtime:
+            need_build = True
+
+    if need_build:
+        print("Building Civet...", file=sys.stderr)
+        r = subprocess.run(["swift", "build", "-q"], cwd=PROJECT_ROOT)
+        if r.returncode != 0:
+            print("error: swift build failed", file=sys.stderr)
+            sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Compilation helpers
+# ---------------------------------------------------------------------------
+
+def compile_c(c_path, asm_path, extra_args=None):
+    """Run Civet on a C file, write assembly to asm_path.
+    Returns (success, stdout, stderr)."""
+    # Use relative path from project root so __FILE__ matches test expectations
+    try:
+        rel_path = os.path.relpath(c_path, PROJECT_ROOT)
+    except ValueError:
+        rel_path = c_path
+    cmd = [CIVET_BIN, rel_path]
+    if extra_args:
+        cmd.extend(extra_args)
+    r = subprocess.run(cmd, capture_output=True, cwd=PROJECT_ROOT)
+    stdout = r.stdout.decode("utf-8", errors="replace")
+    stderr = r.stderr.decode("utf-8", errors="replace")
+    if r.returncode == 0:
+        with open(asm_path, "w") as f:
+            f.write(stdout)
+    return r.returncode == 0, stdout, stderr
+
+
+def compile_common(tmp_dir):
+    """Compile the chibicc common file to an object. Returns path to common.o."""
+    obj = os.path.join(tmp_dir, "common.o")
+    r = subprocess.run(
+        ["gcc", "-c", "-o", obj, "-xc", COMMON_SRC],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f"error: failed to compile common: {r.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return obj
+
+
+def link(asm_path, out_path, extra_objects=None):
+    """Link assembly with gcc. Returns (success, stderr)."""
+    cmd = ["gcc", "-o", out_path, asm_path, "-z", "noexecstack", "-no-pie"]
+    if extra_objects:
+        cmd.extend(extra_objects)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0, r.stderr
+
+
+def run_binary(bin_path):
+    """Run a binary. Returns (exit_code, stdout+stderr)."""
+    try:
+        r = subprocess.run(
+            [bin_path],
+            capture_output=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        out = r.stdout + r.stderr
+        return r.returncode, out.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        return -1, "TIMEOUT"
+
+
+def apply_filters(text, grep_pattern=None, head_n=None):
+    """Apply grep and head filters to output text."""
+    if grep_pattern:
+        regex = re.compile(grep_pattern)
+        text = "\n".join(line for line in text.splitlines() if regex.search(line))
+    if head_n and head_n > 0:
+        lines = text.splitlines()
+        text = "\n".join(lines[:head_n])
+    return text
+
+# ---------------------------------------------------------------------------
+# Subcommand: run
+# ---------------------------------------------------------------------------
+
+def resolve_c_file(name):
+    """Resolve a C file path. Tries the literal path, then testdata/chibicc/{name}.c."""
+    if os.path.isfile(name):
+        return name
+    candidate = os.path.join(TESTDATA_DIR, name + ".c")
+    if os.path.isfile(candidate):
+        return candidate
+    candidate = os.path.join(TESTDATA_DIR, name)
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def cmd_run(args):
+    ensure_civet_built(args.no_build)
+
+    # Determine source
+    if args.code:
+        tmp_src = tempfile.NamedTemporaryFile(suffix=".c", delete=False, mode="w", dir="/tmp")
+        tmp_src.write(args.code)
+        tmp_src.close()
+        c_path = tmp_src.name
+    elif args.file:
+        c_path = resolve_c_file(args.file)
+        if c_path is None:
+            print(f"error: file not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("error: specify a file or --code", file=sys.stderr)
+        sys.exit(1)
+
+    tmp_dir = tempfile.mkdtemp(prefix="civet_test_")
+    try:
+        asm_path = os.path.join(tmp_dir, "test.s")
+        civet_args = []
+        for flag in (args.dump_coil, args.dump_ssa, args.dump_opt):
+            if flag:
+                civet_args.append(flag)
+
+        ok, stdout, stderr = compile_c(c_path, asm_path, civet_args)
+
+        if args.stderr or not ok:
+            filtered = apply_filters(stderr, args.grep if not args.asm else None, args.head)
+            if filtered:
+                print(filtered, file=sys.stderr)
+            if not ok:
+                sys.exit(1)
+
+        if args.dump_coil or args.dump_ssa or args.dump_opt:
+            filtered = apply_filters(stderr, args.grep, args.head)
+            if filtered:
+                print(filtered)
+            return
+
+        if args.asm:
+            filtered = apply_filters(stdout, args.grep, args.head)
+            print(filtered)
+            return
+
+        # Link and run
+        bin_path = os.path.join(tmp_dir, "test")
+        extra = []
+        if not args.no_common and os.path.isfile(COMMON_SRC):
+            common_obj = compile_common(tmp_dir)
+            extra.append(common_obj)
+            extra.append("-pthread")
+
+        ok, err = link(asm_path, bin_path, extra)
+        if not ok:
+            print(f"link error:\n{err}", file=sys.stderr)
+            sys.exit(1)
+
+        code, output = run_binary(bin_path)
+        filtered = apply_filters(output, args.grep, args.head)
+        if filtered:
+            print(filtered)
+        sys.exit(code)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if args.code:
+            os.unlink(c_path)
+
+# ---------------------------------------------------------------------------
+# Subcommand: chibicc
+# ---------------------------------------------------------------------------
+
+def cmd_chibicc(args):
+    ensure_civet_built(args.no_build)
+
+    # Determine test list
+    if args.tests:
+        tests = args.tests
+    else:
+        tests = list(CHIBICC_TESTS)
+
+    if args.filter:
+        tests = [t for t in tests if fnmatch.fnmatch(t, args.filter)]
+
+    if not tests:
+        print("No tests matched.", file=sys.stderr)
+        sys.exit(1)
+
+    tmp_dir = tempfile.mkdtemp(prefix="civet_chibicc_")
+    try:
+        common_obj = compile_common(tmp_dir)
+        passed = 0
+        failed = 0
+        results = []
+
+        for name in tests:
+            c_path = os.path.join(TESTDATA_DIR, name + ".c")
+            if not os.path.isfile(c_path):
+                result = red("SKIP(not found)")
+                results.append((name, result))
+                continue
+
+            asm_path = os.path.join(tmp_dir, name + ".s")
+            ok, stdout, stderr = compile_c(c_path, asm_path)
+            if not ok:
+                result = red("FAIL(compile)")
+                failed += 1
+                results.append((name, result))
+                # Show first 3 lines of stderr
+                for line in stderr.splitlines()[:3]:
+                    results.append(("", "  " + line))
+                continue
+
+            bin_path = os.path.join(tmp_dir, name)
+            ok, err = link(asm_path, bin_path, [common_obj, "-pthread"])
+            if not ok:
+                result = red("FAIL(asm/link)")
+                failed += 1
+                results.append((name, result))
+                for line in err.splitlines()[:3]:
+                    results.append(("", "  " + line))
+                continue
+
+            code, output = run_binary(bin_path)
+            if code == 0:
+                result = green("PASS")
+                passed += 1
+            elif code == -11 or code == 139:  # SIGSEGV
+                result = red("FAIL(segfault)")
+                failed += 1
+            elif code == 1:
+                result = red("FAIL(wrong answer)")
+                failed += 1
+                # Show last line
+                lines = output.strip().splitlines()
+                if lines:
+                    results.append((name, result))
+                    results.append(("", "  " + lines[-1]))
+                    continue
+            elif code == -1:
+                result = red("FAIL(timeout)")
+                failed += 1
+            else:
+                result = red(f"FAIL(exit={code})")
+                failed += 1
+
+            results.append((name, result))
+
+        # Print results
+        for name, result in results:
+            if name:
+                print(f"{name + ':':<15} {result}")
+            else:
+                print(result)
+
+        # Summary
+        total = passed + failed
+        if failed == 0:
+            print(bold(f"\nALL {total} tests passed"))
+        else:
+            print(bold(f"\n{passed}/{total} tests passed, {failed} failed"))
+
+        sys.exit(0 if failed == 0 else 1)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Subcommand: swift
+# ---------------------------------------------------------------------------
+
+def cmd_swift(args):
+    cmd = ["swift", "test"]
+    if args.filter:
+        cmd.extend(["--filter", args.filter])
+    os.chdir(PROJECT_ROOT)
+    r = subprocess.run(cmd)
+    sys.exit(r.returncode)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="civet-test",
+        description="Civet compiler test runner",
+    )
+    parser.add_argument("--no-build", action="store_true",
+                        help="Skip auto-build of Civet")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # run
+    p_run = sub.add_parser("run", help="Compile, link, and run a single C file")
+    p_run.add_argument("file", nargs="?", help="C file path or chibicc test name")
+    p_run.add_argument("--code", help="Inline C code to compile")
+    p_run.add_argument("--asm", action="store_true", help="Print assembly only")
+    p_run.add_argument("--grep", help="Filter output with regex")
+    p_run.add_argument("--head", type=int, help="Limit output to N lines")
+    p_run.add_argument("--dump-coil", action="store_const", const="--dump-coil",
+                        help="Show COIL IR dump")
+    p_run.add_argument("--dump-ssa", action="store_const", const="--dump-ssa",
+                        help="Show SSA dump")
+    p_run.add_argument("--dump-opt", action="store_const", const="--dump-opt",
+                        help="Show optimized IR dump")
+    p_run.add_argument("--stderr", action="store_true", help="Show stderr output")
+    p_run.add_argument("--no-common", action="store_true",
+                        help="Don't link with chibicc common")
+    p_run.set_defaults(func=cmd_run)
+
+    # chibicc
+    p_chibicc = sub.add_parser("chibicc", help="Run chibicc test suite")
+    p_chibicc.add_argument("tests", nargs="*", help="Specific test names")
+    p_chibicc.add_argument("--filter", help="Filter tests by glob pattern")
+    p_chibicc.set_defaults(func=cmd_chibicc)
+
+    # swift
+    p_swift = sub.add_parser("swift", help="Run Swift unit tests")
+    p_swift.add_argument("--filter", help="Swift test filter pattern")
+    p_swift.set_defaults(func=cmd_swift)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
