@@ -32,6 +32,18 @@ public indirect enum SyntaxExpr: Sendable {
     case exchange(addr: SyntaxExpr, value: SyntaxExpr,
                   type: SyntaxType, loc: SourceLocation)
     case memzero(variable: SyntaxVariableRef, type: SyntaxType, loc: SourceLocation)
+    /// Compound assignment: `x += y`, `x -= y`, etc. `op` is the underlying
+    /// binary operator (`.add` for `+=`, `.sub` for `-=`, etc.).
+    case compoundAssign(op: BinaryOp, lhs: SyntaxExpr, rhs: SyntaxExpr,
+                        type: SyntaxType, loc: SourceLocation)
+    /// Pre-increment/decrement: `++x` (addend=1) or `--x` (addend=-1).
+    /// Result is the new value.
+    case preIncDec(addend: Int, operand: SyntaxExpr,
+                   type: SyntaxType, loc: SourceLocation)
+    /// Post-increment/decrement: `x++` (addend=1) or `x--` (addend=-1).
+    /// Result is the old value.
+    case postIncDec(addend: Int, operand: SyntaxExpr,
+                    type: SyntaxType, loc: SourceLocation)
 }
 
 public enum BinaryOp: Sendable {

@@ -1380,18 +1380,27 @@ public class CParser {
         if let op = compoundAssignOp() {
             _ = cursor.advance()
             let rhs = try assign()
-            return try toAssign(op, node, rhs, loc: l)
+            return .compoundAssign(op: op, lhs: node, rhs: rhs,
+                                   type: typeOf(node), loc: l)
         }
 
         return node
     }
 
-    func compoundAssignOp() -> String? {
-        let t = tok.text
-        if ["+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="].contains(t) {
-            return t
+    func compoundAssignOp() -> BinaryOp? {
+        switch tok.text {
+        case "+=":  return .add
+        case "-=":  return .sub
+        case "*=":  return .mul
+        case "/=":  return .div
+        case "%=":  return .mod
+        case "&=":  return .bitAnd
+        case "|=":  return .bitOr
+        case "^=":  return .bitXor
+        case "<<=": return .shl
+        case ">>=": return .shr
+        default:    return nil
         }
-        return nil
     }
 
     func makeAssign(_ lhs: SyntaxExpr, _ rhs: SyntaxExpr, loc: SourceLocation) -> SyntaxExpr {
@@ -1401,68 +1410,6 @@ public class CParser {
             rhs = synCast(rhs, to: lhsTy, loc: loc)
         }
         return .assign(lhs: lhs, rhs: rhs, type: lhsTy, loc: loc)
-    }
-
-    func toAssign(_ op: String, _ lhs: SyntaxExpr, _ rhs: SyntaxExpr,
-                  loc: SourceLocation) throws -> SyntaxExpr {
-        let lhsTy = typeOf(lhs)
-
-        // For member bitfield: tmp = &A, (*tmp).x = (*tmp).x op rhs
-        if case .member(let base, let mem, _, _) = lhs {
-            let ptrTy = pointerTo(typeOf(base))
-            let tmp = newLVar("", ptrTy)
-            let tmpRef = SyntaxExpr.variable(ref: tmp.makeRef(), type: ptrTy, loc: loc)
-
-            let addr = SyntaxExpr.addressOf(operand: base, type: ptrTy, loc: loc)
-            let assign1 = SyntaxExpr.assign(lhs: tmpRef, rhs: addr, type: ptrTy, loc: loc)
-
-            let deref = SyntaxExpr.deref(operand: tmpRef, type: typeOf(base), loc: loc)
-            let memAccess1 = SyntaxExpr.member(expr: deref, member: mem,
-                                                type: mem.type, loc: loc)
-            let deref2 = SyntaxExpr.deref(operand: tmpRef, type: typeOf(base), loc: loc)
-            let memAccess2 = SyntaxExpr.member(expr: deref2, member: mem,
-                                                type: mem.type, loc: loc)
-
-            let binExpr = try makeBinaryForCompound(op, memAccess2, rhs, loc: loc)
-            let castedBin = synCast(binExpr, to: mem.type, loc: loc)
-            let assign2 = makeAssign(memAccess1, castedBin, loc: loc)
-
-            return .comma(lhs: assign1, rhs: assign2, type: typeOf(assign2), loc: loc)
-        }
-
-        // General case: tmp = &A, *tmp = *tmp op B
-        let ptrTy = pointerTo(lhsTy)
-        let tmp = newLVar("", ptrTy)
-        let tmpRef = SyntaxExpr.variable(ref: tmp.makeRef(), type: ptrTy, loc: loc)
-
-        let addr = SyntaxExpr.addressOf(operand: lhs, type: ptrTy, loc: loc)
-        let assign1 = SyntaxExpr.assign(lhs: tmpRef, rhs: addr, type: ptrTy, loc: loc)
-
-        let deref1 = SyntaxExpr.deref(operand: tmpRef, type: lhsTy, loc: loc)
-        let deref2 = SyntaxExpr.deref(operand: tmpRef, type: lhsTy, loc: loc)
-
-        let binExpr = try makeBinaryForCompound(op, deref2, rhs, loc: loc)
-        let castedBin = synCast(binExpr, to: lhsTy, loc: loc)
-        let assign2 = SyntaxExpr.assign(lhs: deref1, rhs: castedBin, type: lhsTy, loc: loc)
-
-        return .comma(lhs: assign1, rhs: assign2, type: lhsTy, loc: loc)
-    }
-
-    func makeBinaryForCompound(_ op: String, _ lhs: SyntaxExpr, _ rhs: SyntaxExpr,
-                                loc: SourceLocation) throws -> SyntaxExpr {
-        switch op {
-        case "+=": return newAdd(lhs, rhs, loc: loc)
-        case "-=": return newSub(lhs, rhs, loc: loc)
-        case "*=": return makeBinary(.mul, lhs, rhs, loc: loc)
-        case "/=": return makeBinary(.div, lhs, rhs, loc: loc)
-        case "%=": return makeBinary(.mod, lhs, rhs, loc: loc)
-        case "&=": return makeBinary(.bitAnd, lhs, rhs, loc: loc)
-        case "|=": return makeBinary(.bitOr, lhs, rhs, loc: loc)
-        case "^=": return makeBinary(.bitXor, lhs, rhs, loc: loc)
-        case "<<=": return makeBinaryNoConv(.shl, lhs, rhs, loc: loc)
-        case ">>=": return makeBinaryNoConv(.shr, lhs, rhs, loc: loc)
-        default: throw error("unknown compound assignment")
-        }
     }
 
     func conditional() throws -> SyntaxExpr {
@@ -1703,17 +1650,17 @@ public class CParser {
             return .unary(op: .bitNot, operand: operand, type: typeOf(operand), loc: l)
         }
 
-        // ++i → i += 1
+        // ++i
         if cursor.consume("++") {
             let operand = try unary()
-            return try toAssign("+=", operand,
-                                .intLiteral(value: 1, type: tyInt, loc: l), loc: l)
+            return .preIncDec(addend: 1, operand: operand,
+                              type: typeOf(operand), loc: l)
         }
-        // --i → i -= 1
+        // --i
         if cursor.consume("--") {
             let operand = try unary()
-            return try toAssign("-=", operand,
-                                .intLiteral(value: 1, type: tyInt, loc: l), loc: l)
+            return .preIncDec(addend: -1, operand: operand,
+                              type: typeOf(operand), loc: l)
         }
 
         // &&label (GNU labels-as-values)
@@ -1792,30 +1739,20 @@ public class CParser {
             }
 
             if cursor.consume("++") {
-                // A++ → (typeof A)((A += 1) - 1)
-                node = try newIncDec(node, 1, loc: l)
+                node = .postIncDec(addend: 1, operand: node,
+                                   type: typeOf(node), loc: l)
                 continue
             }
 
             if cursor.consume("--") {
-                node = try newIncDec(node, -1, loc: l)
+                node = .postIncDec(addend: -1, operand: node,
+                                   type: typeOf(node), loc: l)
                 continue
             }
 
             break
         }
         return node
-    }
-
-    func newIncDec(_ node: SyntaxExpr, _ addend: Int,
-                   loc: SourceLocation) throws -> SyntaxExpr {
-        let nodeTy = typeOf(node)
-        let one = SyntaxExpr.intLiteral(value: Int64(addend), type: tyInt, loc: loc)
-        let addExpr = newAdd(node, one, loc: loc)
-        let assigned = try toAssign("+=", node, one, loc: loc)
-        let negOne = SyntaxExpr.intLiteral(value: Int64(-addend), type: tyInt, loc: loc)
-        let result = newAdd(assigned, negOne, loc: loc)
-        return synCast(result, to: nodeTy, loc: loc)
     }
 
     func funcall(_ fn: SyntaxExpr, loc: SourceLocation) throws -> SyntaxExpr {

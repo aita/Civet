@@ -205,6 +205,9 @@ func typeOf(_ e: SyntaxExpr) -> SyntaxType {
     case .cas(_, _, _, let t, _): return t
     case .exchange(_, _, let t, _): return t
     case .memzero(_, let t, _): return t
+    case .compoundAssign(_, _, _, let t, _): return t
+    case .preIncDec(_, _, let t, _): return t
+    case .postIncDec(_, _, let t, _): return t
     }
 }
 

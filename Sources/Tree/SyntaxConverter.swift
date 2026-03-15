@@ -559,6 +559,57 @@ public final class SyntaxConverter {
             let zero = CExpr.intLiteral(0, type: cty)
             buf.append(.assign(lhs: v, rhs: zero))
             return v
+
+        // ── Compound assignment (`x += y`, etc.) ────────────────────────────
+        //
+        // Desugared to read-modify-write:
+        //   tmp = &x; *tmp = *tmp op y
+        // For simple variables, no temp pointer is needed.
+
+        case .compoundAssign(let op, let lhs, let rhs, _, _):
+            let rhsExpr = convertExpr(rhs, into: &buf)
+            let lhsExpr = convertExpr(lhs, into: &buf)
+            let lhsTy   = lhsExpr.type
+            let (read, write) = emitAddrReadWrite(lhsExpr, into: &buf)
+            let result = applyCompoundOp(op, lhs: read, rhs: rhsExpr, resultType: lhsTy)
+            buf.append(.assign(lhs: write, rhs: result))
+            return write
+
+        // ── Pre-increment/decrement (`++x`, `--x`) ──────────────────────────
+
+        case .preIncDec(let addend, let operand, _, _):
+            let lhsExpr = convertExpr(operand, into: &buf)
+            let lhsTy   = lhsExpr.type
+            let (read, write) = emitAddrReadWrite(lhsExpr, into: &buf)
+            let one = CExpr.intLiteral(Int64(abs(addend)), type: .int(signed: true))
+            let result: CExpr
+            if addend > 0 {
+                result = cAdd(read, one, resultType: lhsTy)
+            } else {
+                result = cSub(read, one, resultType: lhsTy)
+            }
+            buf.append(.assign(lhs: write, rhs: result))
+            return write
+
+        // ── Post-increment/decrement (`x++`, `x--`) ─────────────────────────
+
+        case .postIncDec(let addend, let operand, _, _):
+            let lhsExpr = convertExpr(operand, into: &buf)
+            let lhsTy   = lhsExpr.type
+            let (read, write) = emitAddrReadWrite(lhsExpr, into: &buf)
+            // Save old value before modifying
+            let old = freshTempVar(type: lhsTy)
+            buf.append(.assign(lhs: old, rhs: read))
+            // Increment/decrement
+            let one = CExpr.intLiteral(Int64(abs(addend)), type: .int(signed: true))
+            let newVal: CExpr
+            if addend > 0 {
+                newVal = cAdd(old, one, resultType: lhsTy)
+            } else {
+                newVal = cSub(old, one, resultType: lhsTy)
+            }
+            buf.append(.assign(lhs: write, rhs: newVal))
+            return old
         }
     }
 
@@ -600,5 +651,183 @@ public final class SyntaxConverter {
     private func flattenStmt(_ stmt: CStmt) -> [CStmt] {
         if case .block(let ss) = stmt { return ss }
         return [stmt]
+    }
+
+    // MARK: - Compound assignment helpers
+
+    /// Emit `tmp = &lhs` and return `(read: *tmp, write: *tmp)` so the LHS is
+    /// evaluated exactly once. This forces the variable through memory (address-taken),
+    /// which matches the old Parser's desugaring behavior and avoids SSA issues
+    /// with loop unrolling and register allocation.
+    private func emitAddrReadWrite(_ lhs: CExpr, into buf: inout [CStmt]) -> (read: CExpr, write: CExpr) {
+        switch lhs {
+        case .variable(_, let ty, _):
+            let ptrTy = CType.pointer(ty)
+            let tmp = freshTempVar(type: ptrTy)
+            buf.append(.assign(lhs: tmp, rhs: .addressOf(lhs, type: ptrTy)))
+            return (.deref(tmp, type: ty), .deref(tmp, type: ty))
+        case .deref(let ptr, let ty):
+            let tmp = freshTempVar(type: .pointer(ty))
+            buf.append(.assign(lhs: tmp, rhs: ptr))
+            return (.deref(tmp, type: ty), .deref(tmp, type: ty))
+        case .member(let base, let name, let offset, let ty):
+            let baseTy = base.type
+            let tmp = freshTempVar(type: .pointer(baseTy))
+            buf.append(.assign(lhs: tmp, rhs: .addressOf(base, type: .pointer(baseTy))))
+            let derefTmp = CExpr.deref(tmp, type: baseTy)
+            return (.member(derefTmp, name: name, offset: offset, type: ty),
+                    .member(derefTmp, name: name, offset: offset, type: ty))
+        default:
+            return (lhs, lhs)
+        }
+    }
+
+    /// Apply a compound assignment binary op, handling pointer arithmetic and type conversions.
+    private func applyCompoundOp(_ op: BinaryOp, lhs: CExpr, rhs: CExpr, resultType: CType) -> CExpr {
+        switch op {
+        case .add: return cAdd(lhs, rhs, resultType: resultType)
+        case .sub: return cSub(lhs, rhs, resultType: resultType)
+        case .shl, .shr:
+            // Shift: no usual arithmetic conversion between operands
+            return .binary(op, lhs, rhs, type: resultType)
+        default:
+            // Usual arithmetic conversion, then cast back to result type
+            let common = getCommonCType(lhs.type, rhs.type)
+            let cl = castC(lhs, to: common)
+            let cr = castC(rhs, to: common)
+            return castC(.binary(op, cl, cr, type: common), to: resultType)
+        }
+    }
+
+    // MARK: - CType arithmetic helpers
+
+    /// Pointer-aware addition: `ptr + n → ptr + n * sizeof(*ptr)`.
+    private func cAdd(_ lhs: CExpr, _ rhs: CExpr, resultType: CType) -> CExpr {
+        let lt = lhs.type, rt = rhs.type
+
+        // num + num
+        if cBaseType(lt) == nil && cBaseType(rt) == nil {
+            let common = getCommonCType(lt, rt)
+            return castC(.binary(.add, castC(lhs, to: common), castC(rhs, to: common), type: common),
+                         to: resultType)
+        }
+
+        // Canonicalize: num + ptr → ptr + num
+        if cBaseType(lt) == nil && cBaseType(rt) != nil {
+            return cAdd(rhs, lhs, resultType: resultType)
+        }
+
+        // ptr + num
+        guard let base = cBaseType(lt) else {
+            return .binary(.add, lhs, rhs, type: resultType)
+        }
+        let scale = CExpr.intLiteral(Int64(typeSize(base)), type: .long(signed: true))
+        let scaledRhs = CExpr.binary(.mul, castC(rhs, to: .long(signed: true)), scale,
+                                     type: .long(signed: true))
+        return .binary(.add, lhs, scaledRhs, type: resultType)
+    }
+
+    /// Pointer-aware subtraction: `ptr - n → ptr - n * sizeof(*ptr)`.
+    private func cSub(_ lhs: CExpr, _ rhs: CExpr, resultType: CType) -> CExpr {
+        let lt = lhs.type, rt = rhs.type
+
+        // num - num
+        if cBaseType(lt) == nil && cBaseType(rt) == nil {
+            let common = getCommonCType(lt, rt)
+            return castC(.binary(.sub, castC(lhs, to: common), castC(rhs, to: common), type: common),
+                         to: resultType)
+        }
+
+        // ptr - num
+        if cBaseType(lt) != nil && isIntegerC(rt) {
+            let base = cBaseType(lt)!
+            let scale = CExpr.intLiteral(Int64(typeSize(base)), type: .long(signed: true))
+            let scaledRhs = CExpr.binary(.mul, castC(rhs, to: .long(signed: true)), scale,
+                                         type: .long(signed: true))
+            return .binary(.sub, lhs, scaledRhs, type: resultType)
+        }
+
+        // ptr - ptr
+        if cBaseType(lt) != nil && cBaseType(rt) != nil {
+            let diff = CExpr.binary(.sub, lhs, rhs, type: .long(signed: true))
+            let base = cBaseType(lt)!
+            let divisor = CExpr.intLiteral(Int64(typeSize(base)), type: .long(signed: true))
+            return .binary(.div, diff, divisor, type: .long(signed: true))
+        }
+
+        return .binary(.sub, lhs, rhs, type: resultType)
+    }
+
+    /// Get element type for pointer/array types, `nil` otherwise.
+    private func cBaseType(_ ty: CType) -> CType? {
+        switch ty {
+        case .pointer(let p): return p
+        case .array(let e, _): return e
+        case .vla(let e): return e
+        default: return nil
+        }
+    }
+
+    /// Is this a numeric type (integer or float)?
+    private func isIntegerC(_ ty: CType) -> Bool {
+        switch ty {
+        case .bool, .char, .short, .int, .long, .enumType: return true
+        default: return false
+        }
+    }
+
+    /// Usual arithmetic conversion on CType — mirrors Parser's getCommonType.
+    private func getCommonCType(_ t1: CType, _ t2: CType) -> CType {
+        if cBaseType(t1) != nil { return .pointer(cBaseType(t1)!) }
+        if case .function = t1 { return .pointer(t1) }
+        if case .function = t2 { return .pointer(t2) }
+
+        if case .longDouble = t1 { return .longDouble }
+        if case .longDouble = t2 { return .longDouble }
+        if case .double = t1 { return .double }
+        if case .double = t2 { return .double }
+        if case .float = t1 { return .float }
+        if case .float = t2 { return .float }
+
+        let s1 = typeSize(t1), s2 = typeSize(t2)
+        let p1 = s1 < 4 ? CType.int(signed: true) : t1
+        let p2 = s2 < 4 ? CType.int(signed: true) : t2
+        let ps1 = typeSize(p1), ps2 = typeSize(p2)
+
+        if ps1 != ps2 { return ps1 < ps2 ? p2 : p1 }
+        if isUnsignedC(p2) { return p2 }
+        return p1
+    }
+
+    private func isUnsignedC(_ ty: CType) -> Bool {
+        switch ty {
+        case .char(let s): return !s
+        case .short(let s): return !s
+        case .int(let s): return !s
+        case .long(let s): return !s
+        case .bool: return true
+        default: return false
+        }
+    }
+
+    /// Cast if types differ; skip if already the target type.
+    private func castC(_ expr: CExpr, to ty: CType) -> CExpr {
+        if typesEqual(expr.type, ty) { return expr }
+        return .cast(expr, to: ty)
+    }
+
+    /// Structural type equality (for skipping redundant casts).
+    private func typesEqual(_ a: CType, _ b: CType) -> Bool {
+        switch (a, b) {
+        case (.void, .void), (.bool, .bool), (.float, .float),
+             (.double, .double), (.longDouble, .longDouble), (.enumType, .enumType):
+            return true
+        case (.char(let s1), .char(let s2)): return s1 == s2
+        case (.short(let s1), .short(let s2)): return s1 == s2
+        case (.int(let s1), .int(let s2)): return s1 == s2
+        case (.long(let s1), .long(let s2)): return s1 == s2
+        case (.pointer(let p1), .pointer(let p2)): return typesEqual(p1, p2)
+        default: return false
+        }
     }
 }

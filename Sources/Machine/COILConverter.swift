@@ -1,6 +1,12 @@
 import COIL
 import Tree
 
+/// Round `value` up to the nearest multiple of `alignment`.
+func alignUp(_ value: Int32, to alignment: Int32) -> Int32 {
+    guard alignment > 0 else { return value }
+    return (value + alignment - 1) / alignment * alignment
+}
+
 /// Converts a COIL program (CFG with virtual operands) to a Machine program
 /// (x86-64 instructions with virtual registers).
 public struct COILConverter {
