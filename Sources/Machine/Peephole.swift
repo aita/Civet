@@ -115,6 +115,31 @@ private func peepholeBlock(_ instrs: [Instr]) -> [Instr] {
             }
         }
 
+        // 3b. Address mode folding:
+        //    movMR(sz, mem, r1); aluRmiR(op, sz, .reg(r1), dst) where r1 ≠ dst, r1 dead
+        //    → aluRmiR(op, sz, .mem(mem), dst)
+        //    Also: movMR(sz, mem, r1); cmpRmiR(op, sz, .reg(r1), dst) where r1 dead
+        //    → cmpRmiR(op, sz, .mem(mem), dst)
+        if case .movMR(let sz, let mem, let r1) = instr,
+           (sz == .dword || sz == .qword),
+           i + 1 < instrs.count {
+            let next = instrs[i + 1]
+            switch next {
+            case .aluRmiR(let op, sz, .reg(r1), let dst)
+                where r1 != dst && !regLiveAfter(instrs, from: i + 1, reg: r1):
+                out.append(.aluRmiR(op, sz, src: .mem(mem), dst: dst))
+                skip = true
+                continue
+            case .cmpRmiR(let op, sz, .reg(r1), let dst)
+                where r1 != dst && !regLiveAfter(instrs, from: i + 1, reg: r1):
+                out.append(.cmpRmiR(op, sz, src: .mem(mem), dst: dst))
+                skip = true
+                continue
+            default:
+                break
+            }
+        }
+
         // 4. Fold movsx/movzx where src == dst and sizes make it a nop
         //    (e.g. movzx from dword to dword)
         if case .movsxRmR(let from, let to, let src, let dst) = instr,
@@ -143,18 +168,44 @@ private func peepholeBlock(_ instrs: [Instr]) -> [Instr] {
             }
         }
 
-        // 6. Store-load forwarding:
-        //    movRM(sz, src: r1, dst: mem); movMR(sz, src: mem', dst: r2) where mem == mem'
+        // 6. Store-load forwarding (extended):
+        //    movRM(sz, src: r1, dst: mem); ...; movMR(sz, src: mem', dst: r2) where mem == mem'
         //    → replace load with movRR(sz, src: r1, dst: r2)
+        //    Scans backward through non-aliasing instructions (max 8).
         if case .movMR(let sz, let mem, let dst) = instr, !out.isEmpty {
-            if case .movRM(let sz2, let src, let mem2) = out[out.count - 1],
-               sz == sz2, mem == mem2 {
-                if src == dst {
-                    continue  // store then load to same reg = nop
+            var forwarded = false
+            for j in stride(from: out.count - 1, through: max(0, out.count - 8), by: -1) {
+                let prev = out[j]
+                if case .movRM(let sz2, let src, let mem2) = prev, sz == sz2, mem == mem2 {
+                    // Check that src register and memory base/index haven't been
+                    // redefined between store and load
+                    var clobbered = false
+                    for k in (j + 1)..<out.count {
+                        if let (defR, _) = defRegAndSize(out[k]) {
+                            if defR == src { clobbered = true; break }
+                            if let b = mem.base, defR == b { clobbered = true; break }
+                            if let idx = mem.index, defR == idx { clobbered = true; break }
+                        }
+                    }
+                    if !clobbered {
+                        if src == dst {
+                            forwarded = true  // store then load to same reg = nop
+                        } else {
+                            out.append(.movRR(sz, src: src, dst: dst))
+                            forwarded = true
+                        }
+                    }
+                    break
                 }
-                out.append(.movRR(sz, src: src, dst: dst))
-                continue
+                // Stop if an intervening instruction writes to the same memory
+                if instrMayWriteMemory(prev, mem) { break }
+                // Stop if an intervening instruction redefines the memory's base/index
+                if let (defR, _) = defRegAndSize(prev) {
+                    if let b = mem.base, defR == b { break }
+                    if let idx = mem.index, defR == idx { break }
+                }
             }
+            if forwarded { continue }
         }
 
         // 7. inc/dec: add $1 → inc, sub $1 → dec (shorter encoding)
@@ -168,6 +219,28 @@ private func peepholeBlock(_ instrs: [Instr]) -> [Instr] {
            !flagsLiveAfter(instrs, from: i) {
             out.append(.unaryRm(.dec, sz, dst))
             continue
+        }
+
+        // 7a. xor zeroing: mov $0, %reg → xor %reg, %reg (shorter encoding, breaks dep chain)
+        //     Only safe when flags are not live (xor clobbers ZF/SF/PF/OF/CF).
+        if case .movIR(let sz, 0, let dst) = instr,
+           (sz == .dword || sz == .qword),
+           !flagsLiveAfter(instrs, from: i) {
+            // xorl %r32, %r32 implicitly zero-extends to 64-bit — use .dword always
+            out.append(.aluRmiR(.xor, .dword, src: .reg(dst), dst: dst))
+            continue
+        }
+
+        // 7b. Test-Immediate fusion:
+        //     and $mask, %r; test %r, %r → test $mask, %r (when and result is dead)
+        if case .cmpRmiR(.test, let sz, .reg(let r), let dst) = instr,
+           r == dst, !out.isEmpty {
+            if case .aluRmiR(.and, sz, .imm(let mask), dst) = out[out.count - 1] {
+                if !regLiveAfter(instrs, from: i, reg: dst) {
+                    out[out.count - 1] = .cmpRmiR(.test, sz, src: .imm(mask), dst: dst)
+                    continue
+                }
+            }
         }
 
         // 8. Redundant test elimination after ALU ops:
@@ -212,7 +285,23 @@ private func peepholeBlock(_ instrs: [Instr]) -> [Instr] {
             }
         }
 
-        // 10. LEA zero-offset elimination:
+        // 10. imul $3/$5/$9 → lea (1-cycle lea vs 3-cycle imul)
+        //    imul $3, src, dst → lea (src, src, 2), dst
+        //    imul $5, src, dst → lea (src, src, 4), dst
+        //    imul $9, src, dst → lea (src, src, 8), dst
+        if case .imul(let sz, .imm(let c), let dst) = instr,
+           (sz == .dword || sz == .qword),
+           !flagsLiveAfter(instrs, from: i) {
+            let scale: Int64? = (c == 3) ? 2 : (c == 5) ? 4 : (c == 9) ? 8 : nil
+            if let s = scale {
+                // lea (dst, dst, scale), dst
+                out.append(.lea(sz, src: Memory(base: dst, index: dst,
+                                                scale: UInt8(s)), dst: dst))
+                continue
+            }
+        }
+
+        // 11. LEA zero-offset elimination:
         //    lea 0(%r1), %r2 → movRR %r1, %r2 (shorter encoding)
         //    lea 0(%r1), %r1 → remove (nop)
         if case .lea(let sz, let mem, let dst) = instr,
@@ -273,14 +362,20 @@ private func simplifyBranches(_ f: inout Function) -> Bool {
 
 // MARK: - Empty block removal
 
-/// Remove empty blocks by rewriting jumps to them to their successor.
-/// An empty block is one with zero instructions that falls through to the next block.
+/// Remove empty blocks and jmp-only blocks by rewriting jumps to them to their successor.
+/// An empty block falls through to the next block; a jmp-only block contains a single jmp.
 private func removeEmptyBlocks(_ f: inout Function) -> Bool {
-    // Build redirect map: empty block label → next block label
+    // Build redirect map: block label → effective target label
     var redirect: [String: String] = [:]
     for bi in f.blocks.indices {
         if f.blocks[bi].instructions.isEmpty, bi + 1 < f.blocks.count {
+            // Empty block: falls through to next
             redirect[f.blocks[bi].label] = f.blocks[bi + 1].label
+        } else if f.blocks[bi].instructions.count == 1,
+                  case .jmp(let target) = f.blocks[bi].instructions[0],
+                  f.blocks[bi].label != target {
+            // Jmp-only block: redirects to target (jump threading)
+            redirect[f.blocks[bi].label] = target
         }
     }
     guard !redirect.isEmpty else { return false }
@@ -625,6 +720,112 @@ private func flagsLiveAfter(_ instrs: [Instr], from idx: Int) -> Bool {
     }
     // End of block — conservatively assume flags are live (block terminator may use them).
     return true
+}
+
+/// Check if a GP register is used (read) after instruction at index `from` in the block.
+/// Conservative: returns true at end of block (may be live-out).
+private func regLiveAfter(_ instrs: [Instr], from idx: Int, reg: Reg) -> Bool {
+    for j in (idx + 1)..<instrs.count {
+        let instr = instrs[j]
+        // Check if instr uses reg as source
+        if instrUsesReg(instr, reg) { return true }
+        // Check if instr defines reg (kills it) before any use
+        if let (defR, _) = defRegAndSize(instr), defR == reg { return false }
+    }
+    // End of block — conservatively assume live
+    return true
+}
+
+/// Check if an instruction reads a register (as source, not just as destination).
+private func instrUsesReg(_ instr: Instr, _ reg: Reg) -> Bool {
+    switch instr {
+    case .aluRmiR(_, _, let src, let dst):
+        return sameReg(src, reg) || dst == reg  // dst is both read and written
+    case .imul(_, let src, let dst):
+        return sameReg(src, reg) || dst == reg
+    case .cmpRmiR(_, _, let src, let dst):
+        return sameReg(src, reg) || dst == reg
+    case .shiftR(_, _, let src, let dst):
+        return sameReg(src, reg) || dst == reg
+    case .unaryRm(_, _, let r):
+        return r == reg
+    case .movRR(_, let src, _):
+        return src == reg
+    case .movRM(_, let src, let mem):
+        return src == reg || memUsesReg(mem, reg)
+    case .movMR(_, let mem, _):
+        return memUsesReg(mem, reg)
+    case .movIR:
+        return false
+    case .movIM(_, _, let mem):
+        return memUsesReg(mem, reg)
+    case .movsxRmR(_, _, let src, _):
+        return sameReg(src, reg)
+    case .movzxRmR(_, _, let src, _):
+        return sameReg(src, reg)
+    case .lea(_, let mem, _):
+        return memUsesReg(mem, reg)
+    case .push(_, let op):
+        return sameReg(op, reg)
+    case .cmove(_, _, let src, _):
+        return sameReg(src, reg)
+    case .setcc:
+        return false
+    case .jmpIf:
+        return false
+    case .jmp:
+        return false
+    case .jmpIndirect(let r):
+        return r == reg
+    case .call(let op):
+        return sameReg(op, reg)
+    case .tailCall(let op):
+        return sameReg(op, reg)
+    default:
+        return true  // conservative
+    }
+}
+
+private func sameReg(_ op: Operand, _ reg: Reg) -> Bool {
+    if case .reg(let r) = op { return r == reg }
+    return false
+}
+
+private func memUsesReg(_ mem: Memory, _ reg: Reg) -> Bool {
+    if let b = mem.base, b == reg { return true }
+    if let idx = mem.index, idx == reg { return true }
+    return false
+}
+
+/// Check if an instruction may write to memory at the given address.
+/// Conservative: calls and unknown instructions are assumed to write everywhere.
+private func instrMayWriteMemory(_ instr: Instr, _ mem: Memory) -> Bool {
+    switch instr {
+    case .movRM(_, _, let dst):     return dst == mem || !memDisjoint(dst, mem)
+    case .movIM(_, _, let dst):     return dst == mem || !memDisjoint(dst, mem)
+    case .movMM(_, _, let dst):     return dst == mem || !memDisjoint(dst, mem)
+    case .xmmMovRM(_, _, let dst):  return dst == mem || !memDisjoint(dst, mem)
+    case .push:                     return true  // modifies stack
+    case .call, .tailCall:          return true  // may modify any memory
+    default:                        return false
+    }
+}
+
+/// Conservative disjointness check: two memory operands are disjoint if they
+/// use different base registers or different stack slots with known non-overlapping offsets.
+private func memDisjoint(_ a: Memory, _ b: Memory) -> Bool {
+    // Different base registers → can't prove disjoint (might alias)
+    // Same base + different displacement → disjoint (assuming same size class)
+    if a.base == b.base && a.index == nil && b.index == nil
+       && a.symbol == nil && b.symbol == nil {
+        return a.displacement != b.displacement
+    }
+    // Different symbols → disjoint (different globals)
+    if let sa = a.symbol, let sb = b.symbol, sa != sb,
+       a.base == nil && b.base == nil {
+        return true
+    }
+    return false
 }
 
 private func peepholeDefsFlags(_ instr: Instr) -> Bool {
