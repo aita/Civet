@@ -13,7 +13,7 @@ struct StructClassification {
 /// Classify a struct/union/array type according to System V AMD64 ABI.
 /// Returns per-eightbyte classification for register passing.
 func classifyStruct(_ type: CType) -> StructClassification {
-    let size = typeSize(type)
+    let size = type.size
     if size == 0 || size > 16 {
         return StructClassification(classes: [.memory])
     }
@@ -36,17 +36,17 @@ private func classifyFields(type: CType, offset: Int, classes: inout [ABIClass])
     case .structType(let r):
         var fieldOffset = 0
         for m in r.members {
-            let a = typeAlign(m.type)
+            let a = m.type.align
             fieldOffset = (fieldOffset + a - 1) / a * a
             classifyFields(type: m.type, offset: offset + fieldOffset, classes: &classes)
-            fieldOffset += typeSize(m.type)
+            fieldOffset += m.type.size
         }
     case .unionType(let r):
         for m in r.members {
             classifyFields(type: m.type, offset: offset, classes: &classes)
         }
     case .array(let elem, let count):
-        let elemSz = typeSize(elem)
+        let elemSz = elem.size
         for i in 0..<count {
             classifyFields(type: elem, offset: offset + i * elemSz, classes: &classes)
         }

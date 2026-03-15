@@ -423,7 +423,7 @@ public final class TreeConverter {
         // Sign-extend for signed types: shift left then arithmetic shift right.
         // .shr on signed types produces arithmetic shift (sar) at machine level.
         if isSigned(intType) {
-            let totalBits = typeSize(intType) * 8
+            let totalBits = intType.size * 8
             let shiftAmt = totalBits - bitWidth
             if shiftAmt > 0 {
                 let shlTmp = freshTemp(type: intType)

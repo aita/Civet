@@ -155,17 +155,17 @@ struct DAGBuilder {
                 // as the structCopy source, not the loaded value.
                 if case .structType = dest.type {
                     let copySrc = { if case .load = srcNode.kind { return srcNode.operands[0] } else { return srcNode } }()
-                    let copyNode = makeNode(.structCopy(size: typeSize(dest.type)),
+                    let copyNode = makeNode(.structCopy(size: dest.type.size),
                                              operands: [slotNode, copySrc], type: .void)
                     addSideEffect(copyNode)
                 } else if case .unionType = dest.type {
                     let copySrc = { if case .load = srcNode.kind { return srcNode.operands[0] } else { return srcNode } }()
-                    let copyNode = makeNode(.structCopy(size: typeSize(dest.type)),
+                    let copyNode = makeNode(.structCopy(size: dest.type.size),
                                              operands: [slotNode, copySrc], type: .void)
                     addSideEffect(copyNode)
                 } else if case .array = dest.type {
                     // Array memzero: use structCopy to zero-fill all bytes.
-                    let copyNode = makeNode(.structCopy(size: typeSize(dest.type)),
+                    let copyNode = makeNode(.structCopy(size: dest.type.size),
                                              operands: [slotNode, srcNode], type: .void)
                     addSideEffect(copyNode)
                 } else {
@@ -198,7 +198,7 @@ struct DAGBuilder {
             let addrNode = operandNode(addr)
             // Load CSE: reuse existing load from the same address if no
             // intervening store has invalidated the cache.
-            if let cached = loadCache[addrNode.id], typeSize(cached.type) == typeSize(dest.type) {
+            if let cached = loadCache[addrNode.id], cached.type.size == dest.type.size {
                 defMap[dest.id] = cached
             } else {
                 let node = makeNode(.load, operands: [addrNode], type: dest.type)
@@ -214,12 +214,12 @@ struct DAGBuilder {
                 // If the value comes from a load (e.g. *q = *p), use the load's
                 // source address directly. structCopy needs src ADDRESS, not VALUE.
                 let srcNode = { if case .load = valNode.kind { return valNode.operands[0] } else { return valNode } }()
-                let node = makeNode(.structCopy(size: typeSize(value.type)),
+                let node = makeNode(.structCopy(size: value.type.size),
                                      operands: [addrNode, srcNode], type: .void)
                 addSideEffect(node)
             } else if case .unionType = value.type {
                 let srcNode = { if case .load = valNode.kind { return valNode.operands[0] } else { return valNode } }()
-                let node = makeNode(.structCopy(size: typeSize(value.type)),
+                let node = makeNode(.structCopy(size: value.type.size),
                                      operands: [addrNode, srcNode], type: .void)
                 addSideEffect(node)
             } else {

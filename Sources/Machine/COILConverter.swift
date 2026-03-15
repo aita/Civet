@@ -149,8 +149,8 @@ public struct COILConverter {
     }
 
     private mutating func lowerGlobalVar(_ v: CVar) -> GlobalVar {
-        let size = typeSize(v.type)
-        let align = max(v.align ?? typeAlign(v.type), 1)
+        let size = v.type.size
+        let align = max(v.align ?? v.type.align, 1)
         var initData: [UInt8]? = nil
         var isStatic = false
         var isTentative = false
@@ -201,8 +201,8 @@ public struct COILConverter {
         var tempOffset: Int32 = 0
         for v in allVars {
             guard case .local(let id) = v.storage else { continue }
-            let size = max(Int32(typeSize(v.type)), 1)
-            var align = max(Int32(v.align ?? typeAlign(v.type)), 1)
+            let size = max(Int32(v.type.size), 1)
+            var align = max(Int32(v.align ?? v.type.align), 1)
             // GCC/System V convention: arrays ≥ 16 bytes are 16-byte aligned.
             if case .array = v.type, size >= 16 { align = max(align, 16) }
             tempOffset = alignUp(tempOffset + size, to: align)

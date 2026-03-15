@@ -721,7 +721,7 @@ public final class SyntaxConverter {
         guard let base = cBaseType(lt) else {
             return .binary(.add, lhs, rhs, type: resultType)
         }
-        let scale = CExpr.intLiteral(Int64(typeSize(base)), type: .long(signed: true))
+        let scale = CExpr.intLiteral(Int64(base.size), type: .long(signed: true))
         let scaledRhs = CExpr.binary(.mul, castC(rhs, to: .long(signed: true)), scale,
                                      type: .long(signed: true))
         return .binary(.add, lhs, scaledRhs, type: resultType)
@@ -741,7 +741,7 @@ public final class SyntaxConverter {
         // ptr - num
         if cBaseType(lt) != nil && isIntegerC(rt) {
             let base = cBaseType(lt)!
-            let scale = CExpr.intLiteral(Int64(typeSize(base)), type: .long(signed: true))
+            let scale = CExpr.intLiteral(Int64(base.size), type: .long(signed: true))
             let scaledRhs = CExpr.binary(.mul, castC(rhs, to: .long(signed: true)), scale,
                                          type: .long(signed: true))
             return .binary(.sub, lhs, scaledRhs, type: resultType)
@@ -751,7 +751,7 @@ public final class SyntaxConverter {
         if cBaseType(lt) != nil && cBaseType(rt) != nil {
             let diff = CExpr.binary(.sub, lhs, rhs, type: .long(signed: true))
             let base = cBaseType(lt)!
-            let divisor = CExpr.intLiteral(Int64(typeSize(base)), type: .long(signed: true))
+            let divisor = CExpr.intLiteral(Int64(base.size), type: .long(signed: true))
             return .binary(.div, diff, divisor, type: .long(signed: true))
         }
 
@@ -789,10 +789,10 @@ public final class SyntaxConverter {
         if case .float = t1 { return .float }
         if case .float = t2 { return .float }
 
-        let s1 = typeSize(t1), s2 = typeSize(t2)
+        let s1 = t1.size, s2 = t2.size
         let p1 = s1 < 4 ? CType.int(signed: true) : t1
         let p2 = s2 < 4 ? CType.int(signed: true) : t2
-        let ps1 = typeSize(p1), ps2 = typeSize(p2)
+        let ps1 = p1.size, ps2 = p2.size
 
         if ps1 != ps2 { return ps1 < ps2 ? p2 : p1 }
         if isUnsignedC(p2) { return p2 }

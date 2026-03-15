@@ -1246,8 +1246,8 @@ func buildPatternTable() -> [ISelPattern] {
                 let retABI = classifyStruct(node.type)
                 if retABI.isMemory {
                     // Allocate stack space for return buffer, pass address in first int arg.
-                    let retSize = Int32(typeSize(node.type))
-                    let retAlign = Int32(max(typeAlign(node.type), 8))
+                    let retSize = Int32(node.type.size)
+                    let retAlign = Int32(max(node.type.align, 8))
                     ctx.currentStackOffset = alignUp(ctx.currentStackOffset + retSize, to: retAlign)
                     retStructSlot = ctx.currentStackOffset
                     let bufReg = ctx.freshVirtual()
@@ -1258,7 +1258,7 @@ func buildPatternTable() -> [ISelPattern] {
                     }
                 } else {
                     // Small struct returned in registers; allocate temp stack slot for storing result.
-                    let retSize = Int32(max(typeSize(node.type), 16)) // ensure room for 2 qwords
+                    let retSize = Int32(max(node.type.size, 16)) // ensure room for 2 qwords
                     ctx.currentStackOffset = alignUp(ctx.currentStackOffset + retSize, to: 8)
                     retStructSlot = ctx.currentStackOffset
                 }
@@ -1280,7 +1280,7 @@ func buildPatternTable() -> [ISelPattern] {
                 }
                 if isStructArg {
                     let abi = classifyStruct(origType)
-                    let structSz = typeSize(origType)
+                    let structSz = origType.size
                     // Get struct address: nodeOperand for struct vars returns the address.
                     let addrOp = nodeOperand(argNode, ctx: &ctx)
                     let addrReg = ensureReg(addrOp, size: .qword, ctx: &ctx)
@@ -1399,7 +1399,7 @@ func buildPatternTable() -> [ISelPattern] {
             if isAggregate(node.type), let slot = retStructSlot {
                 // Struct return: store return registers to temp stack slot.
                 let retABI = classifyStruct(node.type)
-                let structSz = typeSize(node.type)
+                let structSz = node.type.size
                 if !retABI.isMemory {
                     var retIntIdx = 0
                     var retSseIdx = 0

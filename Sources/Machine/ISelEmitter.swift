@@ -342,7 +342,7 @@ public struct InstructionSelector {
                 // Check for struct return
                 if isAggregateType(f.returnType) {
                     let abi = classifyStruct(f.returnType)
-                    let structSz = typeSize(f.returnType)
+                    let structSz = f.returnType.size
 
                     // Get struct address (return value is a struct variable → its address)
                     let structOp = resolveOperand(value, builder: builder, ctx: &ctx)
@@ -533,7 +533,7 @@ public struct InstructionSelector {
             // ── Struct/union/array parameter ──────────────────────────────
             if isAggregateType(p.type) {
                 let abi = classifyStruct(p.type)
-                let structSz = typeSize(p.type)
+                let structSz = p.type.size
                 guard let targetSlot = stackSlots[id] else { continue }
 
                 if abi.isMemory {
