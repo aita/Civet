@@ -167,6 +167,7 @@ struct LinearScanAllocator {
 
         // 3. Compute live intervals for each virtual register
         var intervals: [Int: LiveInterval] = [:]  // vreg -> interval
+        var vregDefPositions: [Int: [Int]] = [:]   // vreg -> list of definition positions
 
         // MachPhi destinations are defined at block entry (before any instruction).
         // Seed their intervals using blockStartPos (best approximation before posMap is built).
@@ -182,6 +183,7 @@ struct LinearScanAllocator {
             for phi in block.phis {
                 if case .virtual(let v) = phi.dest {
                     let isFloatPhi = phi.size == .single || phi.size == .double_
+                    vregDefPositions[v, default: []].append(bStart)
                     if intervals[v] == nil {
                         intervals[v] = LiveInterval(vreg: v, start: bStart, end: bStart,
                                                      reg: nil, spillSlot: nil,
@@ -200,6 +202,7 @@ struct LinearScanAllocator {
             // Process definitions
             for reg in defsOf(instr) {
                 if case .virtual(let v) = reg {
+                    vregDefPositions[v, default: []].append(pos)
                     if intervals[v] == nil {
                         let isFloat = isFloatDef(instr)
                         intervals[v] = LiveInterval(vreg: v, start: pos, end: pos,
@@ -492,30 +495,42 @@ struct LinearScanAllocator {
         }
 
         // Split vregs: position-aware range lookup.
-        // First sub-interval (smallest start) keeps its register (boundary store saves to slot).
-        // Subsequent sub-intervals use spillSlot only (no boundary load — avoids arg reg conflicts).
+        // Each sub-interval keeps its allocated register (if any).
+        // Boundary stores save first half's reg to shared slot before split point.
+        // Boundary loads restore from shared slot into second half's reg after split point.
         var splitRanges: [Int: [(start: Int, end: Int, reg: PhysReg?, spillSlot: Int32?)]] = [:]
-        // Group by vreg, sort by start, then first interval keeps reg, rest use slot
-        var splitGroups: [Int: [LiveInterval]] = [:]
-        for iv in sorted where splitVregs.contains(iv.vreg) {
-            splitGroups[iv.vreg, default: []].append(iv)
+        var secondHalfStarts: Set<Int> = []  // sorted indices that are second+ halves
+        var splitGroups: [Int: [(sortedIdx: Int, iv: LiveInterval)]] = [:]
+        for (idx, iv) in sorted.enumerated() where splitVregs.contains(iv.vreg) {
+            splitGroups[iv.vreg, default: []].append((sortedIdx: idx, iv: iv))
         }
         for (vreg, group) in splitGroups {
-            let sortedGroup = group.sorted { $0.start < $1.start }
-            for (idx, iv) in sortedGroup.enumerated() {
+            let sortedGroup = group.sorted { $0.iv.start < $1.iv.start }
+            for (idx, entry) in sortedGroup.enumerated() {
+                let iv = entry.iv
                 if idx == 0 {
-                    // First sub-interval: use register if available, spillSlot=nil
+                    // First sub-interval: use register if available
                     splitRanges[vreg, default: []].append(
                         (start: iv.start, end: iv.end,
                          reg: iv.reg,
                          spillSlot: iv.reg != nil ? nil : iv.spillSlot))
                 } else {
-                    // Subsequent sub-intervals: always use spillSlot (no register)
-                    // Avoids boundary load conflicts with argument registers.
+                    // Subsequent sub-intervals: keep allocated register only if:
+                    // 1. The boundary position is a call position (boundary load goes
+                    //    after the call, safe from argument register conflicts).
+                    // 2. No redefinitions of the vreg within the second half's range
+                    //    (boundary load captures value once; redefs would make it stale).
+                    let bpos = iv.start
+                    let hasRedefInRange = (vregDefPositions[vreg] ?? []).contains {
+                        $0 > bpos && $0 <= iv.end
+                    }
+                    let canUseReg = iv.reg != nil && callPositions.contains(bpos)
+                                    && !hasRedefInRange
                     splitRanges[vreg, default: []].append(
                         (start: iv.start, end: iv.end,
-                         reg: nil,
+                         reg: canUseReg ? iv.reg : nil,
                          spillSlot: iv.spillSlot))
+                    if canUseReg { secondHalfStarts.insert(entry.sortedIdx) }
                 }
             }
         }
@@ -541,8 +556,10 @@ struct LinearScanAllocator {
         // This allows the rewrite phase to dynamically find free registers instead of
         // reserving dedicated scratch registers (r10, r11, xmm15).
         var liveRegsAt = Array(repeating: Set<PhysReg>(), count: posMap.count)
-        for iv in sorted where iv.reg != nil {
-            let lo = max(0, iv.start)
+        for (sivIdx, iv) in sorted.enumerated() where iv.reg != nil {
+            // Second-half split intervals: register isn't live at start (boundary load
+            // happens after the instruction at start), so begin from start+1.
+            let lo = max(0, secondHalfStarts.contains(sivIdx) ? iv.start + 1 : iv.start)
             let hi = min(posMap.count - 1, iv.end)
             if lo <= hi {
                 for pos in lo...hi {
@@ -581,14 +598,15 @@ struct LinearScanAllocator {
         let labelToBlockIdx = Dictionary(uniqueKeysWithValues:
             function.blocks.enumerated().map { ($1.label, $0) })
 
-        // 7f. Boundary store copies: first half reg → shared slot (at boundary position).
-        // No boundary loads — second half reloads via normal spill mechanism.
+        // 7f. Boundary copies at split points.
+        // Store: first half reg → shared slot (BEFORE instruction at bpos).
+        // Load:  shared slot → second half reg (AFTER instruction at bpos).
         var boundaryCopiesBeforePos: [Int: [Instr]] = [:]
+        var boundaryCopiesAfterPos: [Int: [Instr]] = [:]
         for (vreg, ranges) in splitRanges {
             let isFloat = floatVregs.contains(vreg)
             for j in 0..<(ranges.count - 1) {
                 let first = ranges[j], second = ranges[j + 1]
-                guard let r1 = first.reg else { continue }
                 // Find shared slot from either half
                 let slot: Int32
                 if let s = second.spillSlot { slot = s }
@@ -597,21 +615,49 @@ struct LinearScanAllocator {
                 else { continue }
 
                 let bpos = second.start
-                if isFloat {
-                    boundaryCopiesBeforePos[bpos, default: []].append(
-                        .xmmMovRM(.double_, src: .physical(r1), dst: .stack(slot)))
-                } else {
-                    boundaryCopiesBeforePos[bpos, default: []].append(
-                        .movRM(.qword, src: .physical(r1), dst: .stack(slot)))
+
+                // Store first half's register to shared slot (before bpos)
+                if let r1 = first.reg {
+                    if isFloat {
+                        boundaryCopiesBeforePos[bpos, default: []].append(
+                            .xmmMovRM(.double_, src: .physical(r1), dst: .stack(slot)))
+                    } else {
+                        boundaryCopiesBeforePos[bpos, default: []].append(
+                            .movRM(.qword, src: .physical(r1), dst: .stack(slot)))
+                    }
+                }
+
+                // Load shared slot into second half's register (after bpos).
+                // Only emit boundary load when bpos is a call position — this
+                // ensures the load goes after the call instruction, avoiding
+                // clobbering argument registers during call setup.
+                // For non-call split points, the second half uses spillSlot normally.
+                if let r2 = second.reg, callPositions.contains(bpos) {
+                    if isFloat {
+                        boundaryCopiesAfterPos[bpos, default: []].append(
+                            .xmmMovMR(.double_, src: .stack(slot), dst: .physical(r2)))
+                    } else {
+                        boundaryCopiesAfterPos[bpos, default: []].append(
+                            .movMR(.qword, src: .stack(slot), dst: .physical(r2)))
+                    }
                 }
             }
         }
 
         // Helper: look up the assignment for a split vreg at a given position.
+        // At the exact start of a second+ half with a register, the boundary load
+        // hasn't executed yet, so return spillSlot instead of reg.
         func splitLookup(_ vreg: Int, at pos: Int) -> (reg: PhysReg?, spillSlot: Int32?) {
             guard let ranges = splitRanges[vreg] else { return (nil, nil) }
-            for r in ranges {
-                if r.start <= pos && pos <= r.end { return (r.reg, r.spillSlot) }
+            for (idx, r) in ranges.enumerated() {
+                if r.start <= pos && pos <= r.end {
+                    // At exact start of second+ half with reg: boundary load is after
+                    // this instruction, so use spillSlot for reload at this position.
+                    if idx > 0 && pos == r.start && r.reg != nil {
+                        return (nil, r.spillSlot)
+                    }
+                    return (r.reg, r.spillSlot)
+                }
             }
             // Fallback: nearest range
             if let last = ranges.last(where: { $0.end < pos }) { return (last.reg, last.spillSlot) }
@@ -778,6 +824,12 @@ struct LinearScanAllocator {
                             }
                         }
                     }
+                }
+
+                // Insert split boundary load copies after this instruction.
+                // These load the shared spill slot into the second half's register.
+                if pos >= 0, let copies = boundaryCopiesAfterPos[pos] {
+                    newInstrs.append(contentsOf: copies)
                 }
             }
             function.blocks[bi].instructions = newInstrs
