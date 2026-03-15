@@ -154,7 +154,7 @@ public final class SyntaxMapper {
                 throw MappingError.invalidState("VLA type without base type")
             }
             let element = try mapType(base)
-            return cache(key, .vla(element: element),
+            return cache(key, .vla(element: element, sizeVar: nil),
                          size: size, align: align, isAtomic: isAtomic, name: name)
 
         case TY_STRUCT:

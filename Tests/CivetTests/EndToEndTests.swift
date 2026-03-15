@@ -1,7 +1,7 @@
 import COIL
 import Foundation
 import Machine
-import SyntaxMapper
+import Parser
 import Testing
 import Tree
 
@@ -32,7 +32,7 @@ import Tree
                            "/usr/include/x86_64-linux-gnu",
                            "/usr/include"] + includePaths
 
-        let syntaxUnit = try SyntaxMapper().parseFile(path, includePaths: allIncludes)
+        let syntaxUnit = try parseFile(path, includePaths: allIncludes)
         let treeUnit = SyntaxConverter().convert(syntaxUnit)
         let coil = TreeConverter().convert(treeUnit)
         let ssa = SSABuilder().build(coil)
@@ -875,8 +875,7 @@ import Tree
     @Test func repeatedParseDoesNotLeak() throws {
         let path = fixturePath("demo.c")
         for _ in 0..<50 {
-            let mapper = SyntaxMapper()
-            _ = try mapper.parseFile(path, includePaths: defaultIncludePaths)
+            _ = try parseFile(path, includePaths: defaultIncludePaths)
         }
     }
 
@@ -885,8 +884,7 @@ import Tree
         for file in files {
             let path = fixturePath(file)
             guard FileManager.default.fileExists(atPath: path) else { continue }
-            let mapper = SyntaxMapper()
-            let result = try mapper.parseFile(path, includePaths: defaultIncludePaths)
+            let result = try parseFile(path, includePaths: defaultIncludePaths)
             #expect(!result.declarations.isEmpty)
         }
     }

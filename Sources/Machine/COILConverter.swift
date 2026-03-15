@@ -188,7 +188,9 @@ public struct COILConverter {
         // register or stack slot. This preserves relative positions between
         // adjacent variables, which is required for pointer arithmetic like
         // `&y - &z` to work correctly.
-        let allVars = f.params + f.locals
+        // Allocate locals in reverse order to match chibicc's layout
+        // (last declared variable gets the highest stack address).
+        let allVars = f.params + f.locals.reversed()
         var precomputedOffsets: [Int: Int32] = [:]
         var tempOffset: Int32 = 0
         for v in allVars {

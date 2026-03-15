@@ -1,7 +1,7 @@
 import COIL
 import Foundation
 import Machine
-import SyntaxMapper
+import Parser
 import Tree
 
 final class StderrOutputStream: TextOutputStream {
@@ -37,7 +37,7 @@ struct Civet {
         ]
 
         do {
-            let syntaxUnit = try SyntaxMapper().parseFile(path, includePaths: includePaths)
+            let syntaxUnit = try parseFile(path, includePaths: includePaths)
             let treeUnit = SyntaxConverter().convert(syntaxUnit)
             let coil = TreeConverter().convert(treeUnit)
             if CommandLine.arguments.contains("--dump-coil") {

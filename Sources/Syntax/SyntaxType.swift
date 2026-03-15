@@ -29,8 +29,8 @@ public struct SyntaxMember: Sendable {
 
 public final class SyntaxType: Sendable {
     public nonisolated(unsafe) var kind: Kind
-    public let size: Int
-    public let align: Int
+    public nonisolated(unsafe) var size: Int
+    public nonisolated(unsafe) var align: Int
     public let isAtomic: Bool
     public let name: String?
 
@@ -47,7 +47,7 @@ public final class SyntaxType: Sendable {
         case `enum`
         case pointer(pointee: SyntaxType)
         case array(element: SyntaxType, length: Int)
-        case vla(element: SyntaxType)
+        case vla(element: SyntaxType, sizeVar: SyntaxVariableRef?)
         case `struct`(members: [SyntaxMember], isFlexible: Bool, isPacked: Bool)
         case union(members: [SyntaxMember])
         case function(returnType: SyntaxType, params: [SyntaxType], isVariadic: Bool)

@@ -84,7 +84,7 @@ public final class SyntaxConverter {
         case .array(let elem, let len):
             return cache(.array(element: convertType(elem), count: len), for: key)
 
-        case .vla(let elem):
+        case .vla(let elem, _):
             return cache(.vla(element: convertType(elem)), for: key)
 
         case .function(let ret, let params, let variadic):
@@ -337,11 +337,15 @@ public final class SyntaxConverter {
         let i1 = CType.int(signed: true)
         for info in cases {
             let check: CExpr
-            if info.begin == info.end {
-                check = .binary(.eq, cv, .intLiteral(info.begin, type: cvType), type: i1)
+            // Truncate case values to the switch condition type's width
+            // (e.g. 0xffffffff as uint → -1 as int)
+            let begin = truncateToType(info.begin, cvType)
+            let end = truncateToType(info.end, cvType)
+            if begin == end {
+                check = .binary(.eq, cv, .intLiteral(begin, type: cvType), type: i1)
             } else {
-                let lo = CExpr.binary(.le, .intLiteral(info.begin, type: cvType), cv, type: i1)
-                let hi = CExpr.binary(.le, cv, .intLiteral(info.end,   type: cvType), type: i1)
+                let lo = CExpr.binary(.le, .intLiteral(begin, type: cvType), cv, type: i1)
+                let hi = CExpr.binary(.le, cv, .intLiteral(end,   type: cvType), type: i1)
                 check  = .binary(.bitAnd, lo, hi, type: i1)
             }
             s.append(.if(cond: check, then: .goto(info.label), else: nil))
@@ -573,6 +577,23 @@ public final class SyntaxConverter {
     /// Prepends `pre` statements before `stmt`, flattening if possible.
     private func withPre(_ pre: [CStmt], _ stmt: CStmt) -> CStmt {
         pre.isEmpty ? stmt : .block(pre + flattenStmt(stmt))
+    }
+
+    /// Truncate an Int64 case value to the switch condition type's bit-width.
+    private func truncateToType(_ val: Int64, _ ty: CType) -> Int64 {
+        switch ty {
+        case .int(let signed):
+            let trunc = Int32(truncatingIfNeeded: val)
+            return signed ? Int64(trunc) : Int64(UInt32(bitPattern: trunc))
+        case .short(let signed):
+            let trunc = Int16(truncatingIfNeeded: val)
+            return signed ? Int64(trunc) : Int64(UInt16(bitPattern: trunc))
+        case .char(let signed):
+            let trunc = Int8(truncatingIfNeeded: val)
+            return signed ? Int64(trunc) : Int64(UInt8(bitPattern: trunc))
+        default:
+            return val
+        }
     }
 
     /// Unwraps a single `.block` into its children; otherwise returns `[stmt]`.

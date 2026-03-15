@@ -20,6 +20,10 @@ let package = Package(
             dependencies: ["Common"]
         ),
         .target(
+            name: "Parser",
+            dependencies: ["Common", "Syntax"]
+        ),
+        .target(
             name: "Tree",
             dependencies: ["Common", "Syntax"]
         ),
@@ -37,11 +41,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "Civet",
-            dependencies: ["SyntaxMapper", "Tree", "COIL", "Machine"]
+            dependencies: ["Parser", "Tree", "COIL", "Machine"]
         ),
         .testTarget(
             name: "CivetTests",
-            dependencies: ["SyntaxMapper", "Tree", "COIL", "Machine"],
+            dependencies: ["Parser", "Tree", "COIL", "Machine"],
             resources: [.copy("Fixtures")]
         ),
     ]
