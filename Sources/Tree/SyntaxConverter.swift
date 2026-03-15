@@ -708,10 +708,18 @@ public final class SyntaxConverter {
     private func emitAddrReadWrite(_ lhs: CExpr, into buf: inout [CStmt]) -> (read: CExpr, write: CExpr) {
         switch lhs {
         case .variable(_, let ty, _):
-            let ptrTy = CType.pointer(ty)
-            let tmp = freshTempVar(type: ptrTy)
-            buf.append(.assign(lhs: tmp, rhs: .addressOf(lhs, type: ptrTy)))
-            return (.deref(tmp, type: ty), .deref(tmp, type: ty))
+            // Scalar types: use variable directly, no addressOf needed.
+            // This keeps the variable SSA-eligible (not address-taken).
+            switch ty {
+            case .structType, .unionType, .array, .vla:
+                // Aggregate types need memory semantics — keep addressOf path.
+                let ptrTy = CType.pointer(ty)
+                let tmp = freshTempVar(type: ptrTy)
+                buf.append(.assign(lhs: tmp, rhs: .addressOf(lhs, type: ptrTy)))
+                return (.deref(tmp, type: ty), .deref(tmp, type: ty))
+            default:
+                return (lhs, lhs)
+            }
         case .deref(let ptr, let ty):
             let tmp = freshTempVar(type: .pointer(ty))
             buf.append(.assign(lhs: tmp, rhs: ptr))

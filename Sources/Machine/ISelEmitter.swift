@@ -128,7 +128,14 @@ public struct InstructionSelector {
                 if let emitted = emitNode(node, ctx: &ctx) {
                     if case .reg(let r) = emitted, r == vreg { continue }
                     let sz = crossBlockUses.first(where: { $0.vreg == vreg })?.size ?? .qword
-                    ctx.instrs.append(.mov(sz, src: emitted, dst: .reg(vreg)))
+                    // Use XMM move for float/double types
+                    if case .reg(let srcReg) = emitted,
+                       (sz == .single || sz == .double_) {
+                        let xmmSz: Machine.Size = sz
+                        ctx.instrs.append(.xmmMovRR(xmmSz, src: srcReg, dst: vreg))
+                    } else {
+                        ctx.instrs.append(.mov(sz, src: emitted, dst: .reg(vreg)))
+                    }
                 }
             }
 
@@ -328,6 +335,19 @@ public struct InstructionSelector {
                        let reg = varMap[id], seen.insert(id).inserted {
                         result.append((vreg: reg, size: Size.from(type)))
                     }
+                }
+            }
+        }
+        // Also check this block's own phis for loop back-edge args:
+        // A phi at this block may reference a variable defined in this block
+        // (via a back-edge predecessor). The varMap register must be materialized
+        // so that emitPhiCopies at the back-edge predecessor can read it.
+        for phi in block.phis {
+            for arg in phi.args {
+                if case .variable(_, let id, let type) = arg.value,
+                   defsInBlock.contains(id),
+                   let reg = varMap[id], seen.insert(id).inserted {
+                    result.append((vreg: reg, size: Size.from(type)))
                 }
             }
         }
@@ -623,14 +643,21 @@ public struct InstructionSelector {
                     }
                 }
             } else {
-                // Two-phase: spill register to temp slot first
+                // Two-phase for stack-destined params; direct movRR for vreg-destined params.
+                // Virtual registers have no conflict with physical arg registers, so
+                // phys→vreg copies are safe without the spill-then-reload dance.
                 if isFloat(p.type) {
                     if sseIdx < PhysReg.sseArgRegs.count {
                         let src = PhysReg.sseArgRegs[sseIdx]; sseIdx += 1
-                        currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
-                        let slot = currentStackOffset
-                        instrs.append(.xmmMovRM(sz, src: .physical(src), dst: .stack(slot)))
-                        paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: true, spillSlot: slot))
+                        if let dst = varMap[id] {
+                            // Direct phys→vreg: no conflict possible
+                            instrs.append(.xmmMovRR(sz, src: .physical(src), dst: dst))
+                        } else {
+                            currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
+                            let slot = currentStackOffset
+                            instrs.append(.xmmMovRM(sz, src: .physical(src), dst: .stack(slot)))
+                            paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: true, spillSlot: slot))
+                        }
                     } else {
                         let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
                         if let dst = varMap[id] {
@@ -641,11 +668,19 @@ public struct InstructionSelector {
                 } else {
                     if intIdx < PhysReg.intArgRegs.count {
                         let src = PhysReg.intArgRegs[intIdx]; intIdx += 1
-                        currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
-                        let slot = currentStackOffset
-                        instrs.append(.movRM(.qword, src: .physical(src),
-                                           dst: .stack(slot)))
-                        paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: false, spillSlot: slot))
+                        if let dst = varMap[id] {
+                            // Direct phys→vreg: no conflict possible
+                            instrs.append(.movRR(sz, src: .physical(src), dst: dst))
+                        } else if let offset = stackSlots[id] {
+                            instrs.append(.movRM(.qword, src: .physical(src),
+                                               dst: .stack(offset)))
+                        } else {
+                            currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
+                            let slot = currentStackOffset
+                            instrs.append(.movRM(.qword, src: .physical(src),
+                                               dst: .stack(slot)))
+                            paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: false, spillSlot: slot))
+                        }
                     } else {
                         let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
                         if let dst = varMap[id] {

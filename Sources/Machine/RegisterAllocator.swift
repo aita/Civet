@@ -302,6 +302,26 @@ struct LinearScanAllocator {
             }
         }
 
+        // 4d. Build physical→vreg hint map for parameter copies.
+        // When emitParamMoves emits movRR(phys, vreg), we hint the allocator
+        // to assign the vreg to the same physical register, eliminating the copy.
+        var paramHints: [Int: PhysReg] = [:]
+        for block in function.blocks {
+            for instr in block.instructions {
+                switch instr {
+                case .movRR(_, let src, let dst):
+                    if case .physical(let p) = src, case .virtual(let v) = dst {
+                        paramHints[v] = p
+                    }
+                case .xmmMovRR(_, let src, let dst):
+                    if case .physical(let p) = src, case .virtual(let v) = dst {
+                        paramHints[v] = p
+                    }
+                default: break
+                }
+            }
+        }
+
         // 5. Sort intervals by start position (break ties by vreg number for determinism)
         var sorted = Array(intervals.values).sorted {
             $0.start != $1.start ? $0.start < $1.start : $0.vreg < $1.vreg
@@ -340,8 +360,9 @@ struct LinearScanAllocator {
                 return true
             }
 
-            // Compute register hint from copy-related vregs
+            // Compute register hint from copy-related vregs or parameter copies
             let hint = copyHintSource[current.vreg].flatMap { vregAssignment[$0] }
+                        ?? paramHints[current.vreg]
 
             // Try to allocate (spansCall float now goes through pickReg→nil→splitOrSpill
             // instead of force-spill, enabling split at call boundary)
