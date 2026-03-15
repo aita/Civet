@@ -32,8 +32,6 @@ public func fixIllegalInstructions(_ program: Program) -> Program {
 }
 
 private func fixIllegalInstrs(_ function: inout Function) {
-    let gpScratch: Reg = .physical(LinearScanAllocator.gpScratch)
-
     for bi in function.blocks.indices {
         var fixed: [Instr] = []
         for instr in function.blocks[bi].instructions {
@@ -41,13 +39,15 @@ private func fixIllegalInstrs(_ function: inout Function) {
             // movq $large_imm, mem — imm must fit in sign-extended 32 bits
             case .movIM(.qword, let v, let mem)
                 where v > Int64(Int32.max) || v < Int64(Int32.min):
-                fixed.append(.movIR(.qword, imm: v, dst: gpScratch))
-                fixed.append(.movRM(.qword, src: gpScratch, dst: mem))
+                let scratch = scavengeGP(instr)
+                fixed.append(.movIR(.qword, imm: v, dst: .physical(scratch)))
+                fixed.append(.movRM(.qword, src: .physical(scratch), dst: mem))
                 continue
             // movMM: mem→mem must go through scratch register
             case .movMM(let sz, let src, let dst):
-                fixed.append(.movMR(sz, src: src, dst: gpScratch))
-                fixed.append(.movRM(sz, src: gpScratch, dst: dst))
+                let scratch = scavengeGP(instr)
+                fixed.append(.movMR(sz, src: src, dst: .physical(scratch)))
+                fixed.append(.movRM(sz, src: .physical(scratch), dst: dst))
                 continue
             // aluRmiR/cmpRmiR with .mem src are legal x86-64 instructions
             // (e.g. addl (%rax), %ecx) — no expansion needed.
@@ -58,6 +58,28 @@ private func fixIllegalInstrs(_ function: inout Function) {
         }
         function.blocks[bi].instructions = fixed
     }
+}
+
+/// Scavenge a GP register not used by the given instruction.
+private func scavengeGP(_ instr: Instr) -> PhysReg {
+    let usedRegs = Set((defsOf(instr) + usesOf(instr)).compactMap { reg -> PhysReg? in
+        if case .physical(let p) = reg { return p }
+        return nil
+    })
+    // Also collect registers used in memory addressing modes
+    var memBaseRegs = Set<PhysReg>()
+    _ = instr.mapMemory { mem in
+        if case .physical(let p) = mem.base { memBaseRegs.insert(p) }
+        if case .physical(let p) = mem.index { memBaseRegs.insert(p) }
+        return mem
+    }
+    let allUsed = usedRegs.union(memBaseRegs)
+    if let scratch = PhysReg.allocatableGP.first(where: { !allUsed.contains($0) }) {
+        return scratch
+    }
+    // Emergency: all registers in use — use push/pop around a borrowed register.
+    // This shouldn't happen in practice (13 GP regs, instructions use at most ~4).
+    return PhysReg.allocatableGP[0]
 }
 
 // MARK: - Live Interval
@@ -220,23 +242,32 @@ struct LinearScanAllocator {
 
         // 3c. Annotate intervals with loop depth (for spill weight in eviction).
         let blockDepths = computeBlockLoopDepths()
-        for pos in 0..<posMap.count {
-            let blockIdx = posMap[pos].blockIdx
-            let d = blockDepths[blockIdx]
-            guard d > 0 else { continue }
-            for v in intervals.keys {
-                if intervals[v]!.start <= pos && intervals[v]!.end >= pos {
-                    intervals[v]!.loopDepth = max(intervals[v]!.loopDepth, d)
+        let loopBlocks = blockDepths.enumerated().filter { $0.element > 0 }
+        for v in intervals.keys {
+            var maxDepth = 0
+            let iv = intervals[v]!
+            for (bi, d) in loopBlocks {
+                let bStart = blockFirstPos[bi] ?? 0
+                let bEnd = blockLastPos[bi] ?? 0
+                if iv.start <= bEnd && iv.end >= bStart {
+                    maxDepth = max(maxDepth, d)
                 }
             }
+            if maxDepth > 0 { intervals[v]!.loopDepth = maxDepth }
         }
 
-        // 4. Mark intervals that span calls
-        for pos in callPositions {
-            for v in intervals.keys {
-                if intervals[v]!.start < pos && intervals[v]!.end > pos {
-                    intervals[v]!.spansCall = true
-                }
+        // 4. Mark intervals that span calls (binary search per interval)
+        let sortedCalls = callPositions.sorted()
+        for v in intervals.keys {
+            let iv = intervals[v]!
+            // Binary search for first call position > iv.start
+            var lo = 0, hi = sortedCalls.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if sortedCalls[mid] <= iv.start { lo = mid + 1 } else { hi = mid }
+            }
+            if lo < sortedCalls.count && sortedCalls[lo] < iv.end {
+                intervals[v]!.spansCall = true
             }
         }
 
@@ -248,26 +279,44 @@ struct LinearScanAllocator {
         let originalVregs = Set(intervals.keys)
         mergeCoalescedIntervals(&intervals, uf: &coalescingUF)
 
+        // 4c. Build copy-hint map: vreg → related vreg (from movRR/xmmMovRR)
+        // After coalescing, some copies remain. Hints allow pickReg to prefer the
+        // physical register already assigned to the copy partner.
+        var copyHintSource: [Int: Int] = [:]
+        for block in function.blocks {
+            for instr in block.instructions {
+                switch instr {
+                case .movRR(_, let src, let dst), .xmmMovRR(_, let src, let dst):
+                    if case .virtual(let sv) = src, case .virtual(let dv) = dst {
+                        let rs = coalescingUF.find(sv), rd = coalescingUF.find(dv)
+                        if rs != rd && intervals[rs] != nil && intervals[rd] != nil {
+                            copyHintSource[rs] = rd
+                            copyHintSource[rd] = rs
+                        }
+                    }
+                default: break
+                }
+            }
+        }
+
         // 5. Sort intervals by start position (break ties by vreg number for determinism)
         var sorted = Array(intervals.values).sorted {
             $0.start != $1.start ? $0.start < $1.start : $0.vreg < $1.vreg
         }
 
-
-
-        // 6. Linear scan allocation
+        // 6. Linear scan allocation with unhandled stack (supports live range splitting).
+        // unhandled stores indices into sorted in descending start order; popLast = min start.
+        var unhandled: [Int] = Array(sorted.indices.reversed())
         var active: [Int] = []  // indices into sorted, sorted by end
-        var freeGP = PhysReg.allocatableGP.filter { $0 != Self.gpScratch && $0 != Self.gpScratch2 }
-            .sorted { $0.rawValue < $1.rawValue }
-        var freeSSE = (PhysReg.sseArgRegs + [.xmm8, .xmm9, .xmm10, .xmm11,
-                                              .xmm12, .xmm13, .xmm14])
-            .sorted { $0.rawValue < $1.rawValue }
-        // xmm15 reserved as scratch
+        var freeGP = PhysReg.allocatableGP.sorted { $0.rawValue < $1.rawValue }
+        var freeSSE = PhysReg.allSSE.sorted { $0.rawValue < $1.rawValue }
 
         var spillOffset = function.stackSize
         var usedCalleeSaved: Set<PhysReg> = []
+        var vregAssignment: [Int: PhysReg] = [:]  // vreg → assigned physical register (for hints)
+        var sharedSpillSlots: Set<Int32> = []  // spill slots used for split boundaries
 
-        for i in sorted.indices {
+        while let i = unhandled.popLast() {
             let current = sorted[i]
 
             // Expire old intervals
@@ -288,43 +337,61 @@ struct LinearScanAllocator {
                 return true
             }
 
-            // Try to allocate
+            // Compute register hint from copy-related vregs
+            let hint = copyHintSource[current.vreg].flatMap { vregAssignment[$0] }
+
+            // Try to allocate (spansCall float now goes through pickReg→nil→splitOrSpill
+            // instead of force-spill, enabling split at call boundary)
             if current.isFloat {
-                if current.spansCall {
-                    // All XMM registers are caller-saved — force spill, never steal a register.
-                    spillOffset += 8
-                    sorted[i].spillSlot = spillOffset
-                } else if let reg = pickReg(from: &freeSSE, spansCall: current.spansCall,
+                if let reg = pickReg(from: &freeSSE, spansCall: current.spansCall,
                                      isFloat: true,
-                                     interval: current, fixedIntervals: fixedIntervals) {
+                                     interval: current, fixedIntervals: fixedIntervals,
+                                     hint: hint) {
                     sorted[i].reg = reg
-                    active.append(i)
-                    active.sort { sorted[$0].end < sorted[$1].end }
+                    vregAssignment[current.vreg] = reg
+                    let insertPos = active.firstIndex { sorted[$0].end >= sorted[i].end } ?? active.endIndex
+                    active.insert(i, at: insertPos)
                 } else {
-                    // Spill
-                    spill(&sorted, index: i, active: &active, freePool: &freeSSE,
-                          spillOffset: &spillOffset)
+                    splitOrSpill(&sorted, index: i, active: &active,
+                                 freeGP: &freeGP, freeSSE: &freeSSE,
+                                 spillOffset: &spillOffset, unhandled: &unhandled,
+                                 sharedSpillSlots: &sharedSpillSlots,
+                                 sortedCalls: sortedCalls,
+                                 fixedIntervals: fixedIntervals,
+                                 usedCalleeSaved: &usedCalleeSaved,
+                                 vregAssignment: &vregAssignment,
+                                 copyHintSource: copyHintSource)
                 }
             } else {
                 if let reg = pickReg(from: &freeGP, spansCall: current.spansCall,
                                      isFloat: false,
-                                     interval: current, fixedIntervals: fixedIntervals) {
+                                     interval: current, fixedIntervals: fixedIntervals,
+                                     hint: hint) {
                     sorted[i].reg = reg
+                    vregAssignment[current.vreg] = reg
                     if PhysReg.calleeSavedGP.contains(reg) { usedCalleeSaved.insert(reg) }
-                    active.append(i)
-                    active.sort { sorted[$0].end < sorted[$1].end }
+                    let insertPos = active.firstIndex { sorted[$0].end >= sorted[i].end } ?? active.endIndex
+                    active.insert(i, at: insertPos)
                 } else {
-                    // Spill
-                    spill(&sorted, index: i, active: &active, freePool: &freeGP,
-                          spillOffset: &spillOffset)
+                    splitOrSpill(&sorted, index: i, active: &active,
+                                 freeGP: &freeGP, freeSSE: &freeSSE,
+                                 spillOffset: &spillOffset, unhandled: &unhandled,
+                                 sharedSpillSlots: &sharedSpillSlots,
+                                 sortedCalls: sortedCalls,
+                                 fixedIntervals: fixedIntervals,
+                                 usedCalleeSaved: &usedCalleeSaved,
+                                 vregAssignment: &vregAssignment,
+                                 copyHintSource: copyHintSource)
                 }
             }
         }
 
-        // 6b. Stack slot coloring — reuse slots whose live intervals don't overlap
+        // 6b. Stack slot coloring — reuse slots whose live intervals don't overlap.
+        // Exclude shared spill slots from coloring (split sub-intervals must share the same slot).
         let baseStackSize = function.stackSize
-        let spilledIndices = sorted.indices.filter { sorted[$0].spillSlot != nil }
-            .sorted { sorted[$0].start < sorted[$1].start }
+        let spilledIndices = sorted.indices.filter {
+            sorted[$0].spillSlot != nil && !sharedSpillSlots.contains(sorted[$0].spillSlot!)
+        }.sorted { sorted[$0].start < sorted[$1].start }
         if !spilledIndices.isEmpty {
             var availableSlots: [(offset: Int32, freeAfter: Int)] = []
             var nextOffset = baseStackSize
@@ -344,18 +411,111 @@ struct LinearScanAllocator {
         }
 
 
-        // 7. Build vreg → assignment map
+        // 6c. Second-Chance Allocation: try to assign registers to spilled intervals
+        // that fit entirely within a free range (no overlap with any active assignment).
+        // Prioritize by spill weight (loop-heavy intervals benefit most from re-allocation).
+        let spilledByWeight = sorted.indices
+            .filter { sorted[$0].reg == nil && sorted[$0].spillSlot != nil }
+            .sorted { sorted[$0].spillWeight > sorted[$1].spillWeight }
+
+        for idx in spilledByWeight {
+            let iv = sorted[idx]
+
+            // Find physical registers that are free for the entire [start, end] range.
+            // A register is free if no other assigned interval overlaps this range.
+            var occupiedRegs = Set<PhysReg>()
+            for other in sorted where other.reg != nil {
+                if other.start <= iv.end && other.end >= iv.start {
+                    occupiedRegs.insert(other.reg!)
+                }
+            }
+            // Also check fixed intervals
+            for (preg, ranges) in fixedIntervals {
+                for r in ranges {
+                    if r.start <= iv.end && r.end >= iv.start {
+                        occupiedRegs.insert(preg)
+                        break
+                    }
+                }
+            }
+
+            // Choose a free register respecting spansCall constraint
+            let candidates: [PhysReg]
+            if iv.spansCall {
+                if iv.isFloat { continue }  // SSE + spansCall → stay spilled
+                candidates = PhysReg.calleeSavedGP.filter { !occupiedRegs.contains($0) }
+            } else if iv.isFloat {
+                candidates = PhysReg.allSSE.filter { !occupiedRegs.contains($0) }
+            } else {
+                candidates = PhysReg.allocatableGP.filter { !occupiedRegs.contains($0) }
+            }
+
+            // Try hint first, then any candidate
+            let scHint = copyHintSource[iv.vreg].flatMap { vregAssignment[$0] }
+            if let h = scHint, candidates.contains(h) {
+                sorted[idx].reg = h
+            } else if let reg = candidates.first {
+                sorted[idx].reg = reg
+            }
+
+            if sorted[idx].reg != nil {
+                // Don't clear spillSlot for shared split slots (needed for boundary copies)
+                if !sharedSpillSlots.contains(sorted[idx].spillSlot ?? 0) {
+                    sorted[idx].spillSlot = nil
+                }
+                if !iv.isFloat, let r = sorted[idx].reg, PhysReg.calleeSavedGP.contains(r) {
+                    usedCalleeSaved.insert(r)
+                }
+                vregAssignment[iv.vreg] = sorted[idx].reg
+            }
+        }
+
+        // 7. Build vreg → assignment map (position-aware for split vregs).
+        // Detect split vregs: same vreg with multiple intervals in sorted.
+        var vregCount: [Int: Int] = [:]
+        for iv in sorted { vregCount[iv.vreg, default: 0] += 1 }
+        var splitVregs = Set(vregCount.filter { $0.value > 1 }.map { $0.key })
+
+        // Non-split vregs: simple assignMap/spillMap
         var assignMap: [Int: PhysReg] = [:]
         var spillMap: [Int: Int32] = [:]
         var rematMap: [Int: Instr] = [:]
-        for iv in sorted {
+        for iv in sorted where !splitVregs.contains(iv.vreg) {
             if let r = iv.reg {
                 assignMap[iv.vreg] = r
             }
-            if let s = iv.spillSlot {
+            if let s = iv.spillSlot, iv.reg == nil {
                 spillMap[iv.vreg] = s
-                // Rematerializable spilled vregs: recompute instead of reload from stack.
                 if let ri = iv.rematInstr { rematMap[iv.vreg] = ri }
+            }
+        }
+
+        // Split vregs: position-aware range lookup.
+        // First sub-interval (smallest start) keeps its register (boundary store saves to slot).
+        // Subsequent sub-intervals use spillSlot only (no boundary load — avoids arg reg conflicts).
+        var splitRanges: [Int: [(start: Int, end: Int, reg: PhysReg?, spillSlot: Int32?)]] = [:]
+        // Group by vreg, sort by start, then first interval keeps reg, rest use slot
+        var splitGroups: [Int: [LiveInterval]] = [:]
+        for iv in sorted where splitVregs.contains(iv.vreg) {
+            splitGroups[iv.vreg, default: []].append(iv)
+        }
+        for (vreg, group) in splitGroups {
+            let sortedGroup = group.sorted { $0.start < $1.start }
+            for (idx, iv) in sortedGroup.enumerated() {
+                if idx == 0 {
+                    // First sub-interval: use register if available, spillSlot=nil
+                    splitRanges[vreg, default: []].append(
+                        (start: iv.start, end: iv.end,
+                         reg: iv.reg,
+                         spillSlot: iv.reg != nil ? nil : iv.spillSlot))
+                } else {
+                    // Subsequent sub-intervals: always use spillSlot (no register)
+                    // Avoids boundary load conflicts with argument registers.
+                    splitRanges[vreg, default: []].append(
+                        (start: iv.start, end: iv.end,
+                         reg: nil,
+                         spillSlot: iv.spillSlot))
+                }
             }
         }
 
@@ -363,15 +523,120 @@ struct LinearScanAllocator {
         for v in originalVregs {
             let rep = coalescingUF.find(v)
             guard rep != v else { continue }
-            if let r = assignMap[rep] { assignMap[v] = r }
-            if let s = spillMap[rep]  { spillMap[v] = s }
-            if let ri = rematMap[rep] { rematMap[v] = ri }
+            if splitVregs.contains(rep) {
+                splitVregs.insert(v)
+                splitRanges[v] = splitRanges[rep]
+            } else {
+                if let r = assignMap[rep] { assignMap[v] = r }
+                if let s = spillMap[rep]  { spillMap[v] = s }
+                if let ri = rematMap[rep] { rematMap[v] = ri }
+            }
+        }
+
+        // 7c. Build float vreg set for O(1) lookup during rewrite.
+        let floatVregs = Set(sorted.filter { $0.isFloat }.map { $0.vreg })
+
+        // 7d. Precompute per-position occupied physical registers for scratch scavenging.
+        // This allows the rewrite phase to dynamically find free registers instead of
+        // reserving dedicated scratch registers (r10, r11, xmm15).
+        var liveRegsAt = Array(repeating: Set<PhysReg>(), count: posMap.count)
+        for iv in sorted where iv.reg != nil {
+            let lo = max(0, iv.start)
+            let hi = min(posMap.count - 1, iv.end)
+            if lo <= hi {
+                for pos in lo...hi {
+                    liveRegsAt[pos].insert(iv.reg!)
+                }
+            }
+        }
+        // Also include fixed intervals (explicit physical register uses at specific positions).
+        for (preg, ranges) in fixedIntervals {
+            for (start, end) in ranges {
+                let lo = max(0, start)
+                let hi = min(posMap.count - 1, end)
+                if lo <= hi {
+                    for pos in lo...hi {
+                        liveRegsAt[pos].insert(preg)
+                    }
+                }
+            }
+        }
+
+        // Build (blockIdx, instrIdx) → position map for the rewrite phase.
+        var instrToPos: [[Int]] = function.blocks.map { Array(repeating: -1, count: $0.instructions.count) }
+        for (pos, loc) in posMap.enumerated() {
+            instrToPos[loc.blockIdx][loc.instrIdx] = pos
+        }
+
+        // 7e. Block start/end positions for phi rewrite.
+        var blockStartPos2: [Int] = function.blocks.map { _ in 0 }
+        var blockEndPos2: [Int] = function.blocks.map { _ in 0 }
+        for bi in function.blocks.indices {
+            if !instrToPos[bi].isEmpty {
+                blockStartPos2[bi] = instrToPos[bi].first ?? 0
+                blockEndPos2[bi] = instrToPos[bi].last ?? 0
+            }
+        }
+        let labelToBlockIdx = Dictionary(uniqueKeysWithValues:
+            function.blocks.enumerated().map { ($1.label, $0) })
+
+        // 7f. Boundary store copies: first half reg → shared slot (at boundary position).
+        // No boundary loads — second half reloads via normal spill mechanism.
+        var boundaryCopiesBeforePos: [Int: [Instr]] = [:]
+        for (vreg, ranges) in splitRanges {
+            let isFloat = floatVregs.contains(vreg)
+            for j in 0..<(ranges.count - 1) {
+                let first = ranges[j], second = ranges[j + 1]
+                guard let r1 = first.reg else { continue }
+                // Find shared slot from either half
+                let slot: Int32
+                if let s = second.spillSlot { slot = s }
+                else if let s = first.spillSlot { slot = s }
+                else if let s = sorted.first(where: { $0.vreg == vreg && $0.spillSlot != nil })?.spillSlot { slot = s }
+                else { continue }
+
+                let bpos = second.start
+                if isFloat {
+                    boundaryCopiesBeforePos[bpos, default: []].append(
+                        .xmmMovRM(.double_, src: .physical(r1), dst: .stack(slot)))
+                } else {
+                    boundaryCopiesBeforePos[bpos, default: []].append(
+                        .movRM(.qword, src: .physical(r1), dst: .stack(slot)))
+                }
+            }
+        }
+
+        // Helper: look up the assignment for a split vreg at a given position.
+        func splitLookup(_ vreg: Int, at pos: Int) -> (reg: PhysReg?, spillSlot: Int32?) {
+            guard let ranges = splitRanges[vreg] else { return (nil, nil) }
+            for r in ranges {
+                if r.start <= pos && pos <= r.end { return (r.reg, r.spillSlot) }
+            }
+            // Fallback: nearest range
+            if let last = ranges.last(where: { $0.end < pos }) { return (last.reg, last.spillSlot) }
+            if let first = ranges.first { return (first.reg, first.spillSlot) }
+            return (nil, nil)
+        }
+
+        // Helper: resolve a vreg to its effective assignment at a position.
+        func effectiveAssignment(_ v: Int, at pos: Int) -> (reg: PhysReg?, spillSlot: Int32?) {
+            if splitVregs.contains(v) {
+                return splitLookup(v, at: pos)
+            }
+            return (assignMap[v], spillMap[v])
         }
 
         // 8. Rewrite instructions
         for bi in function.blocks.indices {
             var newInstrs: [Instr] = []
-            for instr in function.blocks[bi].instructions {
+            for (instrIdx, instr) in function.blocks[bi].instructions.enumerated() {
+                let pos = instrIdx < instrToPos[bi].count ? instrToPos[bi][instrIdx] : -1
+
+                // Insert split boundary store copies before this instruction
+                if pos >= 0, let copies = boundaryCopiesBeforePos[pos] {
+                    newInstrs.append(contentsOf: copies)
+                }
+
                 // Special handling for pcopy: spilled vregs are replaced with their
                 // spill slot memory operands directly, avoiding scratch register conflicts
                 // when multiple float vregs are spilled in the same pcopy.
@@ -380,16 +645,18 @@ struct LinearScanAllocator {
                         var src = copy.src
                         var dst = copy.dst
                         if case .reg(.virtual(let v)) = src {
-                            if let slot = spillMap[v] {
+                            let (r, s) = effectiveAssignment(v, at: pos)
+                            if r == nil, let slot = s {
                                 src = .mem(.stack(slot))
-                            } else if let phys = assignMap[v] {
+                            } else if let phys = r {
                                 src = .reg(.physical(phys))
                             }
                         }
                         if case .reg(.virtual(let v)) = dst {
-                            if let slot = spillMap[v] {
+                            let (r, s) = effectiveAssignment(v, at: pos)
+                            if r == nil, let slot = s {
                                 dst = .mem(.stack(slot))
-                            } else if let phys = assignMap[v] {
+                            } else if let phys = r {
                                 dst = .reg(.physical(phys))
                             }
                         }
@@ -399,68 +666,115 @@ struct LinearScanAllocator {
                     continue
                 }
 
+                // Scavenge scratch registers: find physical registers not live at this position.
+                let occupied = pos >= 0 ? liveRegsAt[pos] : Set<PhysReg>()
+                var freeGPScavenge = PhysReg.allocatableGP.filter { !occupied.contains($0) }
+                var freeSSEScavenge = PhysReg.allSSE.filter { !occupied.contains($0) }
+
+                // Build per-position override maps for split vregs used/defined in this instruction.
+                var posAssignOverride: [Int: PhysReg] = [:]
+                var posSpillOverride: [Int: Int32] = [:]
+                if !splitVregs.isEmpty && pos >= 0 {
+                    for reg in usesOf(instr) + defsOf(instr) {
+                        if case .virtual(let v) = reg, splitVregs.contains(v) {
+                            let (r, s) = splitLookup(v, at: pos)
+                            if let r = r { posAssignOverride[v] = r }
+                            if let s = s { posSpillOverride[v] = s }
+                            // debug: split vreg with no assignment at this position
+                        }
+                    }
+                }
+
                 // Insert reloads for used spilled vregs.
-                // When an instruction has multiple spilled GP uses (e.g. add V11, V14 where
-                // both are spilled), the second unique spilled vreg gets gpScratch2 (r10)
-                // to avoid the two-address conflict where both uses would otherwise share r11.
                 let used = usesOf(instr)
                 var reloadMap: [Int: PhysReg] = [:]
-                var gpScratchUsed = false
                 for reg in used {
-                    if case .virtual(let v) = reg, let slot = spillMap[v],
-                       reloadMap[v] == nil {
+                    if case .virtual(let v) = reg, reloadMap[v] == nil {
+                        // Determine effective spill slot (split-aware)
+                        let slot: Int32?
+                        if let s = posSpillOverride[v] { slot = s }
+                        else if posAssignOverride[v] != nil { slot = nil } // has register
+                        else { slot = spillMap[v] }
+
+                        guard let effectiveSlot = slot else { continue }
+
                         let scratch: PhysReg
-                        if isFloatVreg(v, sorted) {
-                            scratch = Self.sseScratch
-                        } else if !gpScratchUsed {
-                            scratch = Self.gpScratch
-                            gpScratchUsed = true
+                        if isFloatVreg(v, floatVregs) {
+                            guard let s = freeSSEScavenge.popLast() else {
+                                fatalError("No free SSE register for spill reload at pos \(pos)")
+                            }
+                            scratch = s
                         } else {
-                            scratch = Self.gpScratch2
+                            guard let s = freeGPScavenge.popLast() else {
+                                fatalError("No free GP register for spill reload at pos \(pos)")
+                            }
+                            scratch = s
                         }
                         // Rematerialization: recompute cheap values instead of loading from stack
                         if let ri = rematMap[v] {
                             newInstrs.append(emitRemat(ri, scratch: scratch))
-                        } else if isFloatVreg(v, sorted) {
-                            newInstrs.append(.xmmMovMR(.double_, src: .stack(slot),
+                        } else if isFloatVreg(v, floatVregs) {
+                            newInstrs.append(.xmmMovMR(.double_, src: .stack(effectiveSlot),
                                                        dst: .physical(scratch)))
                         } else {
-                            newInstrs.append(.movMR(.qword, src: .stack(slot),
+                            newInstrs.append(.movMR(.qword, src: .stack(effectiveSlot),
                                                    dst: .physical(scratch)))
                         }
                         reloadMap[v] = scratch
                     }
                 }
 
-                // Build def rewrite map: spilled defs go through scratch register.
-                // If the def vreg was already assigned a scratch as a use (two-address),
-                // keep that scratch. Otherwise use the primary scratch.
+                // Build def rewrite map: spilled defs go through scavenged scratch register.
                 let defined = defsOf(instr)
                 for reg in defined {
-                    if case .virtual(let v) = reg, spillMap[v] != nil, reloadMap[v] == nil {
-                        let scratch: PhysReg = isFloatVreg(v, sorted) ? Self.sseScratch : Self.gpScratch
-                        reloadMap[v] = scratch
+                    if case .virtual(let v) = reg, reloadMap[v] == nil {
+                        let isSpilled: Bool
+                        if let _ = posSpillOverride[v] { isSpilled = true }
+                        else if posAssignOverride[v] != nil { isSpilled = false }
+                        else { isSpilled = spillMap[v] != nil }
+
+                        guard isSpilled else { continue }
+                        if isFloatVreg(v, floatVregs) {
+                            guard let s = freeSSEScavenge.popLast() else {
+                                fatalError("No free SSE register for spill def at pos \(pos)")
+                            }
+                            reloadMap[v] = s
+                        } else {
+                            guard let s = freeGPScavenge.popLast() else {
+                                fatalError("No free GP register for spill def at pos \(pos)")
+                            }
+                            reloadMap[v] = s
+                        }
                     }
                 }
 
+                // Merge position overrides into assignMap for rewriteInstr
+                var effectiveAssignMap = assignMap
+                for (v, r) in posAssignOverride { effectiveAssignMap[v] = r }
+
                 // Rewrite the instruction (both uses and defs through scratch)
-                let rewritten = rewriteInstr(instr, assignMap: assignMap, reloadMap: reloadMap)
+                let rewritten = rewriteInstr(instr, assignMap: effectiveAssignMap, reloadMap: reloadMap)
                 // Eliminate redundant copies (same src == dst after coalescing)
                 if !isRedundantCopy(rewritten) {
                     newInstrs.append(rewritten)
                 }
 
                 // Insert stores for defined spilled vregs using the scratch assigned above.
-                // Skip store for rematerializable values — they'll be recomputed on reload.
                 for reg in defined {
-                    if case .virtual(let v) = reg, let slot = spillMap[v], rematMap[v] == nil {
-                        let scratch: PhysReg = reloadMap[v] ?? (isFloatVreg(v, sorted) ? Self.sseScratch : Self.gpScratch)
-                        if isFloatVreg(v, sorted) {
-                            newInstrs.append(.xmmMovRM(.double_, src: .physical(scratch),
+                    if case .virtual(let v) = reg, rematMap[v] == nil {
+                        let effectiveSlot: Int32?
+                        if let s = posSpillOverride[v] { effectiveSlot = s }
+                        else if posAssignOverride[v] != nil { effectiveSlot = nil }
+                        else { effectiveSlot = spillMap[v] }
+
+                        if let slot = effectiveSlot, let scratch = reloadMap[v] {
+                            if isFloatVreg(v, floatVregs) {
+                                newInstrs.append(.xmmMovRM(.double_, src: .physical(scratch),
+                                                           dst: .stack(slot)))
+                            } else {
+                                newInstrs.append(.movRM(.qword, src: .physical(scratch),
                                                        dst: .stack(slot)))
-                        } else {
-                            newInstrs.append(.movRM(.qword, src: .physical(scratch),
-                                                   dst: .stack(slot)))
+                            }
                         }
                     }
                 }
@@ -469,14 +783,36 @@ struct LinearScanAllocator {
         }
 
         // 8b. Rewrite Machine phi nodes (dest + arg srcs → physical regs or spill slots).
+        // Split vregs need position-aware lookup (phi dest → block start, phi arg → pred end).
         for bi in function.blocks.indices {
+            let destPos = blockStartPos2[bi]
             for pi in function.blocks[bi].phis.indices {
-                if case .virtual(let v) = function.blocks[bi].phis[pi].dest,
-                   let phys = assignMap[v] {
-                    function.blocks[bi].phis[pi].dest = .physical(phys)
+                if case .virtual(let v) = function.blocks[bi].phis[pi].dest {
+                    let (r, s) = effectiveAssignment(v, at: destPos)
+                    if let phys = r {
+                        function.blocks[bi].phis[pi].dest = .physical(phys)
+                    } else if let slot = s {
+                        // Make this spill slot visible to eliminateMachinePhis
+                        spillMap[v] = slot
+                    }
                 }
                 function.blocks[bi].phis[pi].args = function.blocks[bi].phis[pi].args.map { arg in
-                    (label: arg.label, src: rewriteOperand(arg.src, assignMap: assignMap, spillMap: spillMap))
+                    var src = arg.src
+                    if case .reg(.virtual(let v)) = src {
+                        let predPos: Int
+                        if let pbi = labelToBlockIdx[arg.label] {
+                            predPos = blockEndPos2[pbi]
+                        } else {
+                            predPos = 0
+                        }
+                        let (r, s) = effectiveAssignment(v, at: predPos)
+                        if let phys = r {
+                            src = .reg(.physical(phys))
+                        } else if let slot = s {
+                            src = .mem(.stack(slot))
+                        }
+                    }
+                    return (label: arg.label, src: src)
                 }
             }
         }
@@ -1010,7 +1346,8 @@ struct LinearScanAllocator {
     private func pickReg(from pool: inout [PhysReg], spansCall: Bool,
                          isFloat: Bool,
                          interval: LiveInterval,
-                         fixedIntervals: [PhysReg: [(start: Int, end: Int)]]) -> PhysReg? {
+                         fixedIntervals: [PhysReg: [(start: Int, end: Int)]],
+                         hint: PhysReg? = nil) -> PhysReg? {
         if pool.isEmpty { return nil }
 
         // All XMM registers are caller-saved in System V ABI.
@@ -1023,6 +1360,23 @@ struct LinearScanAllocator {
                            fixedIntervals: fixedIntervals)
         }
         if viable.isEmpty { return nil }
+
+        // Try hint first: if the hint register is viable and satisfies constraints, use it.
+        // Only use hint when it matches the preferred class to avoid disrupting allocation.
+        if let h = hint, let idx = viable.first(where: { pool[$0] == h }) {
+            if spansCall {
+                // spansCall needs callee-saved
+                if !isFloat && PhysReg.calleeSavedGP.contains(h) {
+                    return pool.remove(at: idx)
+                }
+            } else if isFloat {
+                // SSE has no callee-saved, any hint is fine
+                return pool.remove(at: idx)
+            } else if PhysReg.callerSavedGP.contains(h) {
+                // Non-spansCall GP prefers caller-saved — only accept caller-saved hints
+                return pool.remove(at: idx)
+            }
+        }
 
         if spansCall {
             // MUST use callee-saved register — caller-saved would be clobbered by the call.
@@ -1057,16 +1411,26 @@ struct LinearScanAllocator {
                        spillOffset: inout Int32) {
         // Find the active interval with the lowest spill weight (cheapest to evict).
         // If the current interval is cheaper than any active interval, spill current instead.
-        // When the current interval spans a call, only consider evicting intervals
-        // that hold callee-saved registers (caller-saved would be clobbered).
+        // Only consider evicting intervals of the same register class (GP vs SSE).
+        // spansCall float: no callee-saved XMM in SysV ABI → always spill (skip eviction).
+        // spansCall GP: only consider callee-saved holders (caller-saved would be clobbered).
+        let isFloat = intervals[i].isFloat
+        if intervals[i].spansCall && isFloat {
+            if intervals[i].spillSlot == nil {
+                spillOffset += 8
+                intervals[i].spillSlot = spillOffset
+            }
+            return
+        }
         let candidates: [Int]
-        if intervals[i].spansCall && !intervals[i].isFloat {
-            candidates = active.filter {
+        let sameClassActive = active.filter { intervals[$0].isFloat == isFloat }
+        if intervals[i].spansCall {
+            candidates = sameClassActive.filter {
                 if let r = intervals[$0].reg { return PhysReg.calleeSavedGP.contains(r) }
                 return false
             }
         } else {
-            candidates = active
+            candidates = sameClassActive
         }
         let evictIdx = candidates.min(by: { intervals[$0].spillWeight < intervals[$1].spillWeight })
         let currentWeight = intervals[i].spillWeight
@@ -1074,17 +1438,177 @@ struct LinearScanAllocator {
             // Evict the cheapest active interval, give its register to current
             let stolen = intervals[eidx].reg!
             intervals[i].reg = stolen
-            spillOffset += 8
-            intervals[eidx].spillSlot = spillOffset
+            if intervals[eidx].spillSlot == nil {
+                spillOffset += 8
+                intervals[eidx].spillSlot = spillOffset
+            }
             intervals[eidx].reg = nil
             active.removeAll { $0 == eidx }
             active.append(i)
             active.sort { intervals[$0].end < intervals[$1].end }
         } else {
             // Spill current interval
-            spillOffset += 8
-            intervals[i].spillSlot = spillOffset
+            if intervals[i].spillSlot == nil {
+                spillOffset += 8
+                intervals[i].spillSlot = spillOffset
+            }
         }
+    }
+
+    // MARK: - Live Range Splitting
+
+    /// Try to split the interval at an optimal position before falling back to full spill.
+    /// Splitting creates two sub-intervals for the same vreg with a shared spill slot
+    /// for value transfer at the boundary.
+    private mutating func splitOrSpill(
+        _ intervals: inout [LiveInterval], index i: Int,
+        active: inout [Int],
+        freeGP: inout [PhysReg], freeSSE: inout [PhysReg],
+        spillOffset: inout Int32,
+        unhandled: inout [Int],
+        sharedSpillSlots: inout Set<Int32>,
+        sortedCalls: [Int],
+        fixedIntervals: [PhysReg: [(start: Int, end: Int)]],
+        usedCalleeSaved: inout Set<PhysReg>,
+        vregAssignment: inout [Int: PhysReg],
+        copyHintSource: [Int: Int]
+    ) {
+        let current = intervals[i]
+        let isFloat = current.isFloat
+
+        // Try to find an optimal split point.
+        // Don't re-split intervals that already have a spillSlot from a prior split
+        // (recursive splitting creates conflicting shared slots for boundary copies).
+        if current.spillSlot == nil,
+           let splitPos = findOptimalSplitPoint(current, sortedCalls: sortedCalls),
+           splitPos > current.start + 1, splitPos < current.end {
+
+            // Allocate shared spill slot for value transfer at boundary
+            spillOffset += 8
+            let sharedSlot = spillOffset
+            sharedSpillSlots.insert(sharedSlot)
+
+            // Create second half: [splitPos, original.end]
+            var secondHalf = current
+            secondHalf.start = splitPos
+            secondHalf.reg = nil
+            secondHalf.spillSlot = sharedSlot
+            // A call AT the start of a split sub-interval means the boundary load
+            // (inserted before the call) would be clobbered. Mark spansCall=true.
+            secondHalf.spansCall = isCallAt(splitPos, sortedCalls)
+                                || hasCallInRange(splitPos, current.end, sortedCalls)
+            let newIdx = intervals.count
+            intervals.append(secondHalf)
+
+            // Insert into unhandled at correct position (descending start order,
+            // popLast gives smallest start)
+            let insertAt = unhandled.firstIndex { intervals[$0].start <= splitPos }
+                           ?? unhandled.endIndex
+            unhandled.insert(newIdx, at: insertAt)
+
+            // Shorten first half: [original.start, splitPos - 1]
+            intervals[i].end = splitPos - 1
+            intervals[i].spillSlot = sharedSlot
+            // If this is a re-split sub-interval whose start is a call position,
+            // the boundary load before that call would be clobbered.
+            intervals[i].spansCall = isCallAt(intervals[i].start, sortedCalls)
+                                   || hasCallInRange(intervals[i].start, splitPos - 1, sortedCalls)
+
+            // Try to allocate first half (it's shorter, may succeed now)
+            let hint = copyHintSource[current.vreg].flatMap { vregAssignment[$0] }
+
+            if isFloat {
+                if let reg = pickReg(from: &freeSSE, spansCall: intervals[i].spansCall,
+                                     isFloat: true, interval: intervals[i],
+                                     fixedIntervals: fixedIntervals, hint: hint) {
+                    intervals[i].reg = reg
+                    vregAssignment[current.vreg] = reg
+                    let insertPos = active.firstIndex { intervals[$0].end >= intervals[i].end } ?? active.endIndex
+                    active.insert(i, at: insertPos)
+                    return
+                }
+            } else {
+                if let reg = pickReg(from: &freeGP, spansCall: intervals[i].spansCall,
+                                     isFloat: false, interval: intervals[i],
+                                     fixedIntervals: fixedIntervals, hint: hint) {
+                    intervals[i].reg = reg
+                    vregAssignment[current.vreg] = reg
+                    if PhysReg.calleeSavedGP.contains(reg) { usedCalleeSaved.insert(reg) }
+                    let insertPos = active.firstIndex { intervals[$0].end >= intervals[i].end } ?? active.endIndex
+                    active.insert(i, at: insertPos)
+                    return
+                }
+            }
+
+            // First half also can't get a register — fall through to spill.
+            // spillSlot is already pre-assigned (sharedSlot), so spill() reuses it.
+            if isFloat {
+                spill(&intervals, index: i, active: &active, freePool: &freeSSE,
+                      spillOffset: &spillOffset)
+            } else {
+                spill(&intervals, index: i, active: &active, freePool: &freeGP,
+                      spillOffset: &spillOffset)
+            }
+        } else {
+            // Can't split (too short) — standard spill
+            if isFloat {
+                spill(&intervals, index: i, active: &active, freePool: &freeSSE,
+                      spillOffset: &spillOffset)
+            } else {
+                spill(&intervals, index: i, active: &active, freePool: &freeGP,
+                      spillOffset: &spillOffset)
+            }
+        }
+    }
+
+    /// Find the optimal position to split an interval.
+    /// Prefers call boundaries (resolves spansCall), then midpoint.
+    private func findOptimalSplitPoint(
+        _ interval: LiveInterval, sortedCalls: [Int]
+    ) -> Int? {
+        let lo = interval.start
+        let hi = interval.end
+        guard hi - lo > 2 else { return nil }  // too short to split
+
+        // Priority 1: first call position within the interval
+        var left = 0, right = sortedCalls.count
+        while left < right {
+            let mid = (left + right) / 2
+            if sortedCalls[mid] <= lo { left = mid + 1 } else { right = mid }
+        }
+        if left < sortedCalls.count && sortedCalls[left] < hi {
+            return sortedCalls[left]
+        }
+
+        // Priority 2: midpoint
+        let mid = (lo + hi) / 2
+        if mid > lo + 1 && mid < hi { return mid }
+
+        return nil
+    }
+
+    /// Check if there's a call instruction in the range (start, end) — exclusive both ends.
+    /// For original intervals, this is correct: a call at the exact start (def point) or end
+    /// (last use) doesn't require the value to survive across it.
+    private func hasCallInRange(_ start: Int, _ end: Int, _ sortedCalls: [Int]) -> Bool {
+        var lo = 0, hi = sortedCalls.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if sortedCalls[mid] <= start { lo = mid + 1 } else { hi = mid }
+        }
+        return lo < sortedCalls.count && sortedCalls[lo] < end
+    }
+
+    /// Check if there's a call exactly at the given position (binary search).
+    private func isCallAt(_ pos: Int, _ sortedCalls: [Int]) -> Bool {
+        var lo = 0, hi = sortedCalls.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if sortedCalls[mid] < pos { lo = mid + 1 }
+            else if sortedCalls[mid] > pos { hi = mid }
+            else { return true }
+        }
+        return false
     }
 
     // MARK: - Instruction rewriting
@@ -1185,8 +1709,8 @@ struct LinearScanAllocator {
 
     // MARK: - Float vreg detection
 
-    private func isFloatVreg(_ v: Int, _ intervals: [LiveInterval]) -> Bool {
-        return intervals.first(where: { $0.vreg == v })?.isFloat ?? false
+    private func isFloatVreg(_ v: Int, _ floatVregs: Set<Int>) -> Bool {
+        return floatVregs.contains(v)
     }
 }
 
