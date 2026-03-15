@@ -43,7 +43,8 @@ struct Civet {
             if CommandLine.arguments.contains("--dump-coil") {
                 print(coil.dotRepresentation(), to: &StderrOutputStream.shared)
             }
-            let ssa = SSABuilder().build(coil)
+            let sroa = scalarReplacement(coil)
+            let ssa = SSABuilder().build(sroa)
             if CommandLine.arguments.contains("--dump-ssa") {
                 print(ssa.dotRepresentation(), to: &StderrOutputStream.shared)
             }
