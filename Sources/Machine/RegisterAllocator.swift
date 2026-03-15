@@ -312,6 +312,11 @@ struct LinearScanAllocator {
         var unhandled: [Int] = Array(sorted.indices.reversed())
         var active: [Int] = []  // indices into sorted, sorted by end
         var freeGP = PhysReg.allocatableGP.sorted { $0.rawValue < $1.rawValue }
+        if !function.usesFramePointer {
+            // RBP is callee-saved and usable as a general register when frame pointer is omitted.
+            let idx = freeGP.firstIndex { $0.rawValue >= PhysReg.rbp.rawValue } ?? freeGP.endIndex
+            freeGP.insert(.rbp, at: idx)
+        }
         var freeSSE = PhysReg.allSSE.sorted { $0.rawValue < $1.rawValue }
 
         var spillOffset = function.stackSize
@@ -372,7 +377,7 @@ struct LinearScanAllocator {
                                      hint: hint) {
                     sorted[i].reg = reg
                     vregAssignment[current.vreg] = reg
-                    if PhysReg.calleeSavedGP.contains(reg) { usedCalleeSaved.insert(reg) }
+                    if PhysReg.calleeSavedGP.contains(reg) || reg == .rbp { usedCalleeSaved.insert(reg) }
                     let insertPos = active.firstIndex { sorted[$0].end >= sorted[i].end } ?? active.endIndex
                     active.insert(i, at: insertPos)
                 } else {
@@ -447,11 +452,15 @@ struct LinearScanAllocator {
             let candidates: [PhysReg]
             if iv.spansCall {
                 if iv.isFloat { continue }  // SSE + spansCall → stay spilled
-                candidates = PhysReg.calleeSavedGP.filter { !occupiedRegs.contains($0) }
+                var cs = PhysReg.calleeSavedGP.filter { !occupiedRegs.contains($0) }
+                if !function.usesFramePointer && !occupiedRegs.contains(.rbp) { cs.append(.rbp) }
+                candidates = cs
             } else if iv.isFloat {
                 candidates = PhysReg.allSSE.filter { !occupiedRegs.contains($0) }
             } else {
-                candidates = PhysReg.allocatableGP.filter { !occupiedRegs.contains($0) }
+                var alloc = PhysReg.allocatableGP.filter { !occupiedRegs.contains($0) }
+                if !function.usesFramePointer && !occupiedRegs.contains(.rbp) { alloc.append(.rbp) }
+                candidates = alloc
             }
 
             // Try hint first, then any candidate
@@ -467,7 +476,8 @@ struct LinearScanAllocator {
                 if !sharedSpillSlots.contains(sorted[idx].spillSlot ?? 0) {
                     sorted[idx].spillSlot = nil
                 }
-                if !iv.isFloat, let r = sorted[idx].reg, PhysReg.calleeSavedGP.contains(r) {
+                if !iv.isFloat, let r = sorted[idx].reg,
+                   PhysReg.calleeSavedGP.contains(r) || r == .rbp {
                     usedCalleeSaved.insert(r)
                 }
                 vregAssignment[iv.vreg] = sorted[idx].reg
@@ -878,25 +888,39 @@ struct LinearScanAllocator {
         let calleeSaved = Array(usedCalleeSaved).sorted { $0.rawValue < $1.rawValue }
         function.calleeSaved = calleeSaved
 
+        let useFP = function.usesFramePointer
+
         // Callee-saved pushes occupy space between rbp and the local frame.
         // Adjust all stack-relative (rbp-based) memory operands to account for this.
         let csShift = Int32(calleeSaved.count * 8)
-        if csShift > 0 {
-            adjustStackOffsets(&function, by: csShift)
+        if useFP {
+            if csShift > 0 {
+                adjustStackOffsets(&function, by: csShift)
+            }
         }
 
         // Adjust stack size: original + spill area + callee-saved area, aligned to 16
         let totalStack = spillOffset + csShift
-        // Account for return address + rbp push + callee-saved pushes.
-        // The return address is already on the stack at function entry.
-        let pushCount = calleeSaved.count + 2  // +1 for rbp, +1 for return address
+        // Account for return address + rbp push (if FP used) + callee-saved pushes.
+        let pushCount = calleeSaved.count + (useFP ? 2 : 1)  // +1 for return addr, +1 for rbp if FP
         let frameAdjust = totalStack
-        // Ensure 16-byte alignment of the entire frame
         let totalPushed = Int32(pushCount * 8)
         let aligned = alignUp(frameAdjust, to: 16, considering: totalPushed)
         function.stackSize = aligned
 
-        expandPrologueEpilogue(&function, calleeSaved: calleeSaved, stackAdj: aligned)
+        // Red zone: leaf functions with ≤128 bytes of stack can skip sub/add rsp.
+        // System V AMD64 ABI guarantees 128 bytes below RSP are not clobbered.
+        let isLeaf = !function.blocks.contains { block in
+            block.instructions.contains { if case .call = $0 { return true }; return false }
+        }
+        let useRedZone = isLeaf && !function.hasAlloca && aligned <= 128
+        let effectiveStackAdj = useRedZone ? Int32(0) : aligned
+
+        if !useFP {
+            convertToRSPAddressing(&function, csShift: csShift, stackAdj: effectiveStackAdj)
+        }
+
+        expandPrologueEpilogue(&function, calleeSaved: calleeSaved, stackAdj: effectiveStackAdj)
 
         return function
     }
@@ -1416,10 +1440,12 @@ struct LinearScanAllocator {
 
         // Try hint first: if the hint register is viable and satisfies constraints, use it.
         // Only use hint when it matches the preferred class to avoid disrupting allocation.
+        let isCalleeSaved: (PhysReg) -> Bool = { PhysReg.calleeSavedGP.contains($0) || $0 == .rbp }
+
         if let h = hint, let idx = viable.first(where: { pool[$0] == h }) {
             if spansCall {
                 // spansCall needs callee-saved
-                if !isFloat && PhysReg.calleeSavedGP.contains(h) {
+                if !isFloat && isCalleeSaved(h) {
                     return pool.remove(at: idx)
                 }
             } else if isFloat {
@@ -1433,7 +1459,7 @@ struct LinearScanAllocator {
 
         if spansCall {
             // MUST use callee-saved register — caller-saved would be clobbered by the call.
-            if let idx = viable.first(where: { PhysReg.calleeSavedGP.contains(pool[$0]) }) {
+            if let idx = viable.first(where: { isCalleeSaved(pool[$0]) }) {
                 return pool.remove(at: idx)
             }
             // No callee-saved available → force spill (return nil).
@@ -1479,7 +1505,7 @@ struct LinearScanAllocator {
         let sameClassActive = active.filter { intervals[$0].isFloat == isFloat }
         if intervals[i].spansCall {
             candidates = sameClassActive.filter {
-                if let r = intervals[$0].reg { return PhysReg.calleeSavedGP.contains(r) }
+                if let r = intervals[$0].reg { return PhysReg.calleeSavedGP.contains(r) || r == .rbp }
                 return false
             }
         } else {
@@ -1586,7 +1612,7 @@ struct LinearScanAllocator {
                                      fixedIntervals: fixedIntervals, hint: hint) {
                     intervals[i].reg = reg
                     vregAssignment[current.vreg] = reg
-                    if PhysReg.calleeSavedGP.contains(reg) { usedCalleeSaved.insert(reg) }
+                    if PhysReg.calleeSavedGP.contains(reg) || reg == .rbp { usedCalleeSaved.insert(reg) }
                     let insertPos = active.firstIndex { intervals[$0].end >= intervals[i].end } ?? active.endIndex
                     active.insert(i, at: insertPos)
                     return
@@ -1691,9 +1717,8 @@ struct LinearScanAllocator {
         for bi in function.blocks.indices {
             function.blocks[bi].instructions = function.blocks[bi].instructions.map { instr in
                 instr.mapMemory { mem in
-                    // Only adjust rbp-based stack references (negative displacement)
-                    if case .physical(.rbp) = mem.base, mem.symbol == nil,
-                       mem.displacement < 0 {
+                    // Only adjust stack frame references with negative displacement (locals)
+                    if mem.isFrameRef, mem.displacement < 0 {
                         var m = mem
                         m.displacement -= shift
                         return m
@@ -1704,19 +1729,59 @@ struct LinearScanAllocator {
         }
     }
 
+    // MARK: - RSP-based addressing conversion (frame pointer omission)
+
+    /// Convert all RBP-relative memory references to RSP-relative.
+    ///
+    /// Without FP, stack layout after prologue (push CS...; sub stackAdj, %rsp):
+    ///   entry_rsp:                return addr
+    ///   entry_rsp - csShift:      after callee-saved pushes
+    ///   entry_rsp - csShift - stackAdj: RSP (after sub)
+    ///
+    /// Locals (disp < 0, before adjustStackOffsets):
+    ///   Original: -(localOffset)(%rbp), physical = entry_rsp - 8 - localOffset (FP world)
+    ///   Without FP, local is at entry_rsp - csShift - localOffset
+    ///   RSP-relative: RSP + stackAdj - localOffset → delta_local = stackAdj
+    ///   (adjustStackOffsets was skipped, so disp is still -localOffset)
+    ///
+    /// Stack args (disp > 0, e.g. 16(%rbp)):
+    ///   Original: disp(%rbp), physical = entry_rsp - 8 + disp (FP world)
+    ///   Without FP: same physical = RSP + csShift + stackAdj - 8 + disp
+    ///   delta_arg = csShift + stackAdj - 8
+    private func convertToRSPAddressing(_ function: inout Function,
+                                         csShift: Int32, stackAdj: Int32) {
+        let deltaLocal = stackAdj             // for negative (local) displacements
+        let deltaArg = csShift + stackAdj - 8 // for positive (stack arg) displacements
+        for bi in function.blocks.indices {
+            function.blocks[bi].instructions = function.blocks[bi].instructions.map { instr in
+                instr.mapMemory { mem in
+                    guard mem.isFrameRef else { return mem }
+                    var m = mem
+                    m.base = .physical(.rsp)
+                    m.displacement += (mem.displacement < 0) ? deltaLocal : deltaArg
+                    m.isFrameRef = false
+                    return m
+                }
+            }
+        }
+    }
+
     // MARK: - Prologue / Epilogue expansion
 
     private func expandPrologueEpilogue(_ function: inout Function,
                                          calleeSaved: [PhysReg],
                                          stackAdj: Int32) {
+        let useFP = function.usesFramePointer
         for bi in function.blocks.indices {
             var expanded: [Instr] = []
             for instr in function.blocks[bi].instructions {
                 switch instr {
                 case .prologue:
-                    expanded.append(.push(.qword, .reg(.physical(.rbp))))
-                    expanded.append(.movRR(.qword, src: .physical(.rsp),
-                                           dst: .physical(.rbp)))
+                    if useFP {
+                        expanded.append(.push(.qword, .reg(.physical(.rbp))))
+                        expanded.append(.movRR(.qword, src: .physical(.rsp),
+                                               dst: .physical(.rbp)))
+                    }
                     for r in calleeSaved {
                         expanded.append(.push(.qword, .reg(.physical(r))))
                     }
@@ -1726,20 +1791,30 @@ struct LinearScanAllocator {
                     }
 
                 case .epilogue:
-                    // Use RBP-based restore to handle alloca (dynamic RSP changes).
-                    // leaq -(N)(%rbp), %rsp  where N = calleeSaved.count * 8
-                    let calleeSaveSize = Int32(calleeSaved.count * 8)
-                    if calleeSaveSize > 0 {
-                        expanded.append(.lea(.qword,
-                            src: Memory(base: .physical(.rbp), displacement: -calleeSaveSize),
-                            dst: .physical(.rsp)))
+                    if useFP {
+                        // Use RBP-based restore to handle alloca (dynamic RSP changes).
+                        let calleeSaveSize = Int32(calleeSaved.count * 8)
+                        if calleeSaveSize > 0 {
+                            expanded.append(.lea(.qword,
+                                src: Memory(base: .physical(.rbp), displacement: -calleeSaveSize),
+                                dst: .physical(.rsp)))
+                        } else {
+                            expanded.append(.movRR(.qword, src: .physical(.rbp), dst: .physical(.rsp)))
+                        }
+                        for r in calleeSaved.reversed() {
+                            expanded.append(.pop(.qword, .physical(r)))
+                        }
+                        expanded.append(.pop(.qword, .physical(.rbp)))
                     } else {
-                        expanded.append(.movRR(.qword, src: .physical(.rbp), dst: .physical(.rsp)))
+                        // No frame pointer: restore RSP then pop callee-saved.
+                        if stackAdj > 0 {
+                            expanded.append(.aluRmiR(.add, .qword, src: .imm(Int64(stackAdj)),
+                                                     dst: .physical(.rsp)))
+                        }
+                        for r in calleeSaved.reversed() {
+                            expanded.append(.pop(.qword, .physical(r)))
+                        }
                     }
-                    for r in calleeSaved.reversed() {
-                        expanded.append(.pop(.qword, .physical(r)))
-                    }
-                    expanded.append(.pop(.qword, .physical(.rbp)))
 
                 default:
                     expanded.append(instr)

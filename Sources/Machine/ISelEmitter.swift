@@ -489,6 +489,7 @@ public struct InstructionSelector {
             let sz: Size
             let isFloat: Bool
             let spillSlot: Int32
+            var directSrc: Reg? = nil  // non-nil = skip spill, move directly in phase 2
         }
         var paramInfos: [ParamInfo] = []
         // If the function returns a MEMORY-class struct, rdi is consumed by the
@@ -544,8 +545,8 @@ public struct InstructionSelector {
                         let off = Int32(qi * 8)
                         let remaining = structSz - qi * 8
                         let ldSz: Size = remaining >= 8 ? .qword : .dword
-                        let callerMem = Memory(base: .physical(.rbp), displacement: stackArgOffset + off)
-                        let localMem = Memory(base: .physical(.rbp), displacement: -targetSlot + off)
+                        let callerMem = Memory(base: .physical(.rbp), displacement: stackArgOffset + off, isFrameRef: true)
+                        let localMem = Memory(base: .physical(.rbp), displacement: -targetSlot + off, isFrameRef: true)
                         instrs.append(.movMR(ldSz, src: callerMem, dst: scratch))
                         instrs.append(.movRM(ldSz, src: scratch, dst: localMem))
                     }
@@ -556,7 +557,7 @@ public struct InstructionSelector {
                         let off = Int32(ebIdx * 8)
                         let remaining = structSz - ebIdx * 8
                         let stSz: Size = remaining >= 8 ? .qword : .dword
-                        let dstMem = Memory(base: .physical(.rbp), displacement: -targetSlot + off)
+                        let dstMem = Memory(base: .physical(.rbp), displacement: -targetSlot + off, isFrameRef: true)
 
                         if cls == .sse {
                             if sseIdx < PhysReg.sseArgRegs.count {
@@ -589,7 +590,7 @@ public struct InstructionSelector {
                         }
                     } else {
                         if let dst = varMap[id] {
-                            let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
+                            let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset, isFrameRef: true)
                             instrs.append(.xmmMovMR(sz, src: mem, dst: dst))
                         }
                         stackArgOffset += 8
@@ -605,23 +606,30 @@ public struct InstructionSelector {
                         }
                     } else {
                         if let dst = varMap[id] {
-                            let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
+                            let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset, isFrameRef: true)
                             instrs.append(.movMR(sz, src: mem, dst: dst))
                         }
                         stackArgOffset += 8
                     }
                 }
             } else {
-                // Two-phase: spill register to temp slot first
+                // Two-phase: only spill to temp slot when destination is a stack slot.
+                // When destination is a vreg (varMap), move directly (no physical reg conflict).
                 if isFloat(p.type) {
                     if sseIdx < PhysReg.sseArgRegs.count {
                         let src = PhysReg.sseArgRegs[sseIdx]; sseIdx += 1
-                        currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
-                        let slot = currentStackOffset
-                        instrs.append(.xmmMovRM(sz, src: .physical(src), dst: .stack(slot)))
-                        paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: true, spillSlot: slot))
+                        if let dst = varMap[id] {
+                            // Direct phys → vreg (deferred to phase 2 ordering)
+                            paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: true, spillSlot: -1,
+                                                        directSrc: .physical(src)))
+                        } else {
+                            currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
+                            let slot = currentStackOffset
+                            instrs.append(.xmmMovRM(sz, src: .physical(src), dst: .stack(slot)))
+                            paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: true, spillSlot: slot))
+                        }
                     } else {
-                        let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
+                        let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset, isFrameRef: true)
                         if let dst = varMap[id] {
                             instrs.append(.xmmMovMR(sz, src: mem, dst: dst))
                         }
@@ -630,13 +638,20 @@ public struct InstructionSelector {
                 } else {
                     if intIdx < PhysReg.intArgRegs.count {
                         let src = PhysReg.intArgRegs[intIdx]; intIdx += 1
-                        currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
-                        let slot = currentStackOffset
-                        instrs.append(.movRM(.qword, src: .physical(src),
-                                           dst: .stack(slot)))
-                        paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: false, spillSlot: slot))
+                        if let dst = varMap[id] {
+                            // Direct phys → vreg (deferred to phase 2 ordering)
+                            paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: false, spillSlot: -1,
+                                                        directSrc: .physical(src)))
+                        } else if let offset = stackSlots[id] {
+                            // Stack-slot destination: spill via temp slot
+                            currentStackOffset = alignUp(currentStackOffset + 8, to: 8)
+                            let slot = currentStackOffset
+                            instrs.append(.movRM(.qword, src: .physical(src),
+                                               dst: .stack(slot)))
+                            paramInfos.append(ParamInfo(id: id, sz: sz, isFloat: false, spillSlot: slot))
+                        }
                     } else {
-                        let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset)
+                        let mem = Memory(base: .physical(.rbp), displacement: stackArgOffset, isFrameRef: true)
                         if let dst = varMap[id] {
                             instrs.append(.movMR(sz, src: mem, dst: dst))
                         }
@@ -646,9 +661,19 @@ public struct InstructionSelector {
             }
         }
 
-        // Phase 2 (only for two-phase scalar params): load from temp slots to final destinations
+        // Phase 2: move params to final destinations.
+        // directSrc entries: phys → vreg directly (no spill).
+        // spillSlot entries: temp stack slot → vreg or stack slot.
         for info in paramInfos {
-            if let dst = varMap[info.id] {
+            if let src = info.directSrc {
+                if let dst = varMap[info.id] {
+                    if info.isFloat {
+                        instrs.append(.xmmMovRR(info.sz, src: src, dst: dst))
+                    } else {
+                        instrs.append(.movRR(info.sz, src: src, dst: dst))
+                    }
+                }
+            } else if let dst = varMap[info.id] {
                 if info.isFloat {
                     instrs.append(.xmmMovMR(info.sz, src: .stack(info.spillSlot), dst: dst))
                 } else {

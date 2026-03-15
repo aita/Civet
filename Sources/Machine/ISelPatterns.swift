@@ -1409,7 +1409,7 @@ func buildPatternTable() -> [ISelPattern] {
                         let off = Int32(ebIdx * 8)
                         let remaining = structSz - ebIdx * 8
                         let stSz: Size = remaining >= 8 ? .qword : .dword
-                        let mem = Memory(base: .physical(.rbp), displacement: -slot + off)
+                        let mem = Memory(base: .physical(.rbp), displacement: -slot + off, isFrameRef: true)
                         if cls == .sse {
                             let reg = sseRetRegs[retSseIdx]; retSseIdx += 1
                             ctx.instrs.append(stSz == .dword

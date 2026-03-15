@@ -185,19 +185,26 @@ public struct Memory: Hashable, Sendable {
     public var scale: UInt8       // 1, 2, 4, or 8
     public var displacement: Int32
     public var symbol: String?    // for RIP-relative addressing
+    /// True if this memory operand was created via `.stack()` or represents a
+    /// stack-argument reference (`N(%rbp)` with N>0 for caller's stack args).
+    /// Used by frame-pointer omission to distinguish stack slots from general
+    /// rbp-as-GPR memory accesses.
+    public var isFrameRef: Bool
 
     public init(base: Reg? = nil, index: Reg? = nil, scale: UInt8 = 1,
-                displacement: Int32 = 0, symbol: String? = nil) {
+                displacement: Int32 = 0, symbol: String? = nil,
+                isFrameRef: Bool = false) {
         self.base = base
         self.index = index
         self.scale = scale
         self.displacement = displacement
         self.symbol = symbol
+        self.isFrameRef = isFrameRef
     }
 
     /// Stack slot at `[rbp - offset]`.
     public static func stack(_ offset: Int32) -> Memory {
-        Memory(base: .physical(.rbp), displacement: -offset)
+        Memory(base: .physical(.rbp), displacement: -offset, isFrameRef: true)
     }
 
     /// RIP-relative global reference.
@@ -514,6 +521,8 @@ public struct Function: Sendable {
     public var calleeSaved: [PhysReg]
     public let isStatic: Bool
     public var nextVirtual: Int
+    public var hasAlloca: Bool = false
+    public var usesFramePointer: Bool = true
 
     public init(name: String, blocks: [Block] = [], isStatic: Bool = false) {
         self.name = name

@@ -255,6 +255,23 @@ public struct COILConverter {
 
         mfunc.blocks = blocks
         mfunc.stackSize = alignUp(currentStackOffset, to: 16)
+
+        // Detect alloca/inlineAsm in COIL to set function metadata.
+        var hasAlloca = false
+        var hasInlineAsm = false
+        for block in f.blocks {
+            for instr in block.instructions {
+                switch instr {
+                case .alloca: hasAlloca = true
+                case .asm:    hasInlineAsm = true
+                default: break
+                }
+            }
+        }
+        mfunc.hasAlloca = hasAlloca
+        let isVarargs = f.locals.contains { $0.name == "__va_area__" }
+        mfunc.usesFramePointer = hasAlloca || hasInlineAsm || isVarargs
+
         return mfunc
     }
 

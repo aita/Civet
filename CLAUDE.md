@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Civet is a C compiler written in Swift that compiles C source code to x86-64 assembly (AT&T syntax). It uses chibicc (vendored as a git submodule) for parsing/preprocessing C, then lowers through multiple IRs to produce assembly.
+Civet is a C compiler written in Swift that compiles C source code to x86-64 assembly (AT&T syntax). It has its own recursive-descent C parser (ported from chibicc), then lowers through multiple IRs to produce assembly.
 
 ## Build & Test Commands
 
@@ -12,11 +12,15 @@ Civet is a C compiler written in Swift that compiles C source code to x86-64 ass
 swift build                    # Build (requires Swift 6.2+)
 swift build -c release         # Release build
 
-./test.sh                      # Run all chibicc test suite files
+swift test                               # Run all Swift tests (175 tests)
+swift test --filter EndToEndTests        # Run only end-to-end tests
+swift test --filter "chibiccArith"       # Run a single test by name
+
+./test.sh                      # Run all chibicc test suite files (shell-based)
 ./test.sh string enum          # Run specific chibicc tests
 ./test.sh --inline             # Run inline snippet tests (Tests/run.sh)
 ./t.sh <file.c>                # Quick single-file test
-./t.sh string                  # Quick test of Vendor/chibicc/test/string.c
+./t.sh string                  # Quick test of chibicc test/string.c
 
 bash Tests/run.sh              # Full test suite (inline snippets + chibicc tests)
 bash Tests/run.sh --filter foo # Filter tests by name pattern
@@ -27,25 +31,27 @@ Binary is output to `.build/debug/Civet`. Usage: `Civet <file.c>` outputs assemb
 ## Compilation Pipeline
 
 ```
-C Source → [chibicc parser] → Syntax → Tree → COIL → Machine → x86-64 Assembly
+C Source → [Parser] → Syntax → Tree → COIL → Machine → x86-64 Assembly
 ```
 
 ### Module dependency graph (Package.swift targets)
 
 ```
-ChibiCC (C) ─→ SyntaxMapper ─→ Civet (executable)
-Common ─→ Syntax ─→ Tree ─→ COIL ─→ Machine ─↗
+Parser ─→ Civet (executable)
+Syntax ─→ Tree ─→ COIL ─→ Machine ─↗
 ```
 
 ### IR stages and their modules
 
-1. **Syntax** (`Sources/Syntax/`) — High-level C AST: types, expressions, statements, declarations. Closely mirrors C syntax.
+1. **Parser** (`Sources/Parser/`) — Recursive-descent C parser (ported from chibicc). Includes lexer, preprocessor, and type resolution. Produces `SyntaxTranslationUnit` directly.
 
-2. **Tree** (`Sources/Tree/`) — Simplified semantic IR. `SyntaxConverter` lowers complex control flow (for/while/switch → if/goto), flattens expressions with synthetic temporaries (negative IDs). Only has `if` and `goto` for control flow.
+2. **Syntax** (`Sources/Syntax/`) — High-level C AST: types, expressions, statements, declarations. Closely mirrors C syntax.
 
-3. **COIL** (`Sources/COIL/`) — Control-flow Oriented IR with basic blocks, phi nodes, and SSA form. `TreeConverter` builds the CFG, `SSABuilder` converts to SSA using the Cytron algorithm.
+3. **Tree** (`Sources/Tree/`) — Simplified semantic IR. `SyntaxConverter` lowers complex control flow (for/while/switch → if/goto), flattens expressions with synthetic temporaries (negative IDs). Only has `if` and `goto` for control flow.
 
-4. **Machine** (`Sources/Machine/`) — x86-64 machine IR. `COILConverter` lowers COIL following System V AMD64 ABI. Uses DAG-based instruction selection (`SelectionDAG.swift`, `ISelPatterns.swift`), linear scan register allocation (`RegisterAllocator.swift`), instruction legalization (`Peephole.swift`), and list scheduling (`Scheduler.swift`). `AsmPrinter` emits final assembly.
+4. **COIL** (`Sources/COIL/`) — Control-flow Oriented IR with basic blocks, phi nodes, and SSA form. `TreeConverter` builds the CFG, `SSABuilder` converts to SSA using the Cytron algorithm.
+
+5. **Machine** (`Sources/Machine/`) — x86-64 machine IR. `COILConverter` lowers COIL following System V AMD64 ABI. Uses DAG-based instruction selection (`SelectionDAG.swift`, `ISelPatterns.swift`), linear scan register allocation (`RegisterAllocator.swift`), instruction legalization (`Peephole.swift`), and list scheduling (`Scheduler.swift`). `AsmPrinter` emits final assembly.
 
 ### COIL Optimization Passes (`Sources/COIL/Passes/`)
 
@@ -73,12 +79,6 @@ Supporting analyses: `DominatorTree` (Cooper-Harvey-Kennedy), `LoopInfo` (natura
 - **Spill Weight** — Loop-depth-aware eviction (`RegisterAllocator.swift`)
 - **Stack Slot Coloring** — Non-overlapping spill slot reuse (`RegisterAllocator.swift`)
 
-### Supporting modules
-
-- **Common** (`Sources/Common/`) — Shared utilities (source locations)
-- **SyntaxMapper** (`Sources/SyntaxMapper/`) — FFI bridge mapping chibicc's C parse tree to Syntax IR
-- **ChibiCC** (`Sources/ChibiCC/`) — Swift wrapper target for the vendored chibicc C code
-
 ## COIL IR Design (Named SSA)
 
 Current IR uses named SSA with integer-ID-based variable references:
@@ -96,14 +96,12 @@ All optimization passes use `[Int: ...]` dictionaries keyed by variable ID.
 
 - Synthetic/temporary variables use negative IDs to distinguish from source-level variables
 - SSA versions created by `SSABuilder` use IDs `≤ -100_001` (offset from TreeConverter temps)
-- The chibicc submodule is at `Vendor/chibicc` and provides both the C parser and test suite
-- Tests link against `Vendor/chibicc/test/common` which provides `assert()` and `printf` helpers
+- Chibicc test fixtures are at `Tests/CivetTests/Fixtures/chibicc/`
+- Tests link against `Fixtures/chibicc/common` which provides `assert()` and `printf` helpers
 - Stack layout preserves chibicc's pre-computed offsets (`CVar.stackOffset`)
 
 ## Test Status
 
+- 175 Swift tests across 6 test classes: EndToEndTests, ADCETests, GVNTests, LICMTests, PeepholeIfConversionTests, SCCPTests
 - 36 chibicc tests pass: alignof, alloca, arith, asm, attribute, bitfield, builtin, cast, commonsym, complit, compat, const, constexpr, control, decl, enum, extern, float, generic, initializer, literal, macro, offsetof, pointer, sizeof, stdhdr, string, struct, typedef, typeof, unicode, union, usualconv, varargs, variable, vla
-- ~136+ inline Swift tests pass (EndToEndTests.swift)
-- 9 optimization pass unit tests (OptimizationPassTests.swift)
-- 4 peephole unit tests (PeepholeTests.swift)
 - 4 tests disabled: function (long double), pragma-once (path resolution), atomic (not implemented), tls (not implemented)
