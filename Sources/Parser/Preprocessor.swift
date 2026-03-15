@@ -82,15 +82,19 @@ public class Preprocessor {
             throw ParseError("macro expansion depth exceeded", tokens.first?.loc ?? SourceLocation(fileName: "", line: 0, column: 0))
         }
         var out: [Token] = []
+        // Use a mutable cursor into a contiguous token array.
+        // When a macro is expanded, splice the result in-place
+        // so we loop rather than recurse for each top-level expansion.
+        var buf = tokens
         var i = 0
-        while i < tokens.count {
-            let tok = tokens[i]
+        while i < buf.count {
+            let tok = buf[i]
 
             if tok.kind == .eof { out.append(tok); break }
 
             // Directive: '#' at beginning of line
             if tok.atBOL && tok.text == "#" {
-                i = try processDirective(tokens, i: i + 1, out: &out)
+                i = try processDirective(buf, i: i + 1, out: &out)
                 continue
             }
 
@@ -100,13 +104,14 @@ public class Preprocessor {
                 continue
             }
 
-            // Macro expansion
+            // Macro expansion — iterative splice instead of recursive process()
             if tok.kind == .ident, let macro = macros[tok.text], !tok.hideset.contains(tok.text) {
-                let (expanded, next) = try expandMacro(tokens, at: i, macro: macro)
-                // Re-process expanded tokens
-                let sub = try process(expanded + Array(tokens[next...]))
-                out.append(contentsOf: sub)
-                return out
+                let (expanded, next) = try expandMacro(buf, at: i, macro: macro)
+                // Splice: replace buf[i..<next] with expanded tokens
+                buf.replaceSubrange(i..<next, with: expanded)
+                // Don't advance i — re-examine from the same position
+                // (the expanded tokens may contain more macros to expand)
+                continue
             }
 
             out.append(adjustLine(tok))
