@@ -324,5 +324,79 @@ private func intConst(_ v: Int64) -> Operand { .intConst(v, type: intType) }
         let bodyHasAddressOf = bodyInstrs.contains { if case .addressOf = $0 { return true }; return false }
         #expect(bodyHasAddressOf, "addressOf(i) must remain in loop body — i is address-taken")
     }
+
+    /// When a loop header has two outside predecessors (no natural preheader),
+    /// LICM should insert a preheader block and still hoist invariant code.
+    @Test func insertsPreheaderForMultipleOutsidePreds() {
+        // CFG: entry → (cond) → header or alt, alt → header,
+        //      header → body → header (back edge), header → exit
+        // Two outside predecessors (entry, alt) → no natural preheader.
+        // body has an invariant add that should be hoisted to the inserted preheader.
+        let entry = Block(
+            label: "entry",
+            instructions: [
+                .assign(dest: intVar("x", 1), src: intConst(10)),
+                .compare(lhs: intConst(1), rhs: intConst(0)),
+            ],
+            terminator: .branch(cond: .ne, then: "header", else: "alt")
+        )
+        let alt = Block(
+            label: "alt",
+            instructions: [
+                .assign(dest: intVar("x", 2), src: intConst(20)),
+            ],
+            terminator: .goto("header")
+        )
+        let header = Block(
+            label: "header",
+            phis: [
+                Phi(dest: intVar("x", 3), args: [
+                    (label: "entry", value: intOp("x", 1)),
+                    (label: "alt", value: intOp("x", 2)),
+                    (label: "body", value: intOp("x", 4)),
+                ]),
+            ],
+            instructions: [
+                .compare(lhs: intOp("x", 3), rhs: intConst(0)),
+            ],
+            terminator: .branch(cond: .ne, then: "body", else: "exit")
+        )
+        let body = Block(
+            label: "body",
+            instructions: [
+                // Invariant: both operands are constants.
+                .binary(dest: intVar("inv", 5), op: .add,
+                        lhs: intConst(3), rhs: intConst(7)),
+                .binary(dest: intVar("x", 4), op: .add,
+                        lhs: intOp("x", 3), rhs: intOp("inv", 5)),
+            ],
+            terminator: .goto("header")
+        )
+        let exit = Block(label: "exit", instructions: [], terminator: .return(nil))
+
+        let f = licm(in: makeFunction(blocks: [entry, alt, header, body, exit]))
+
+        // A preheader block should have been inserted.
+        let phBlock = f.blocks.first { $0.label == "header.ph" }
+        #expect(phBlock != nil, "preheader block should be inserted")
+
+        // The preheader should have a goto to header.
+        if let ph = phBlock {
+            if case .goto(let target) = ph.terminator {
+                #expect(target == "header", "preheader should jump to header")
+            } else {
+                Issue.record("preheader should have goto terminator")
+            }
+        }
+
+        // Header phi should reference preheader label (not entry/alt directly).
+        let headerBlock = f.blocks.first { $0.label == "header" }
+        if let hdr = headerBlock, let phi = hdr.phis.first {
+            let labels = phi.args.map { $0.label }
+            #expect(labels.contains("header.ph"), "header phi should reference preheader")
+            #expect(!labels.contains("entry"), "header phi should not reference entry directly")
+            #expect(!labels.contains("alt"), "header phi should not reference alt directly")
+        }
+    }
 }
 
