@@ -1,17 +1,19 @@
-/// Dead store elimination and intra-block load forwarding.
+/// Dead store elimination and load forwarding.
 ///
-/// **Intra-block DSE**: within each block, if a store to address A is followed
-/// by another store to A before any load/call, the first store is dead.
+/// **Phase 1 — Forward DSE + Load Forwarding** (RPO):
+/// - Intra-block DSE: if a store to address A is followed by another store to A
+///   before any load/call, the first store is dead.
+/// - Forward inter-block: stores available at ALL predecessors are killed when
+///   an overwriting store is seen in the current block.
+/// - Load forwarding: if a store `store(A, v)` dominates a `load(r, A)` with
+///   no intervening may-alias store/call/asm, replace the load with `assign(r, v)`.
+///   Works both intra-block and inter-block (all predecessors must agree).
 ///
-/// **Inter-block DSE**: forward must-available-stores dataflow (RPO order).
-/// A store available at ALL predecessors is killed when an overwriting store
-/// is seen in the current block. Back-edge predecessors produce empty sets
-/// (conservative: no cross-loop DSE).
-///
-/// **Load Forwarding (intra-block)**: if a store `store(A, v)` is followed by
-/// `load(r, A)` with no intervening store/call/asm to A, replace the load with
-/// `assign(r, v)`. This handles struct field write-then-read patterns after
-/// GVN has CSE'd the member address computations.
+/// **Phase 2 — Backward must-kill DSE** (post-order):
+/// A store is dead if on ALL forward paths from that store, the same address is
+/// overwritten before being read. Uses backward dataflow with intersection as
+/// meet: `mustKillOut[b] = ∩ mustKillIn[succ(b)]`. Alias analysis ensures loads
+/// through may-aliasing pointers conservatively invalidate the kill set.
 public func deadStoreElimination(in function: Function) -> Function {
     let blocks = function.blocks
     let n = blocks.count
@@ -20,6 +22,7 @@ public func deadStoreElimination(in function: Function) -> Function {
     let dom = f.dominatorTree()
     let preds = dom.preds
     let rpoOrder = dom.rpoOrder
+    let aa = AliasAnalysis(f)
 
     // dead[blockIdx] = set of instrIdx within that block that are dead stores.
     var dead: [Int: Set<Int>] = [:]
@@ -28,9 +31,9 @@ public func deadStoreElimination(in function: Function) -> Function {
 
     // availOut[b]: address key → list of encoded store refs (b*1_000_000 + ii).
     var availOut: [[OpKey: [Int]]] = Array(repeating: [:], count: n)
-    // availValOut[b]: address key → the single stored value (if all paths agree).
-    // Used for intra-block load forwarding only (cleared at block boundaries).
-    var availValOut: [[OpKey: Operand]] = Array(repeating: [:], count: n)
+    // availValOut[b]: address key → (address operand, stored value).
+    // Tracks constant values available at block exit for inter-block load forwarding.
+    var availValOut: [[OpKey: (addr: Operand, value: Operand)]] = Array(repeating: [:], count: n)
 
     for b in rpoOrder {
         // ── Compute availIn[b] ────────────────────────────────────────────
@@ -50,9 +53,27 @@ public func deadStoreElimination(in function: Function) -> Function {
             }
         }
 
-        // Intra-block load forwarding: track last-stored value within this block only.
-        // (Separate from inter-block cur to avoid cross-block value propagation issues.)
-        var localVal: [OpKey: Operand] = [:]
+        // Load forwarding: track address → (addr operand, stored value).
+        // Initialized from inter-block available values (intersection of preds).
+        var localVal: [OpKey: (addr: Operand, value: Operand)] = [:]
+        if !preds[b].isEmpty {
+            // Start with first pred's available values.
+            var commonValKeys = Set(availValOut[preds[b][0]].keys)
+            for p in preds[b].dropFirst() {
+                commonValKeys.formIntersection(availValOut[p].keys)
+            }
+            for key in commonValKeys {
+                guard let first = availValOut[preds[b][0]][key] else { continue }
+                // All predecessors must agree on the same stored value.
+                let allAgree = preds[b].dropFirst().allSatisfy { p in
+                    guard let entry = availValOut[p][key] else { return false }
+                    return OpKey(entry.value) == OpKey(first.value)
+                }
+                if allAgree {
+                    localVal[key] = first
+                }
+            }
+        }
 
         // ── Scan instructions ─────────────────────────────────────────────
         for (ii, instr) in blocks[b].instructions.enumerated() {
@@ -66,22 +87,21 @@ public func deadStoreElimination(in function: Function) -> Function {
                     }
                 }
                 cur[key] = [b * 1_000_000 + ii]
-                // Conservative: any store may alias any tracked address (no alias
-                // analysis), so clear ALL forwarded values first. Then optionally
-                // re-add the current store's constant value for its specific key.
-                localVal.removeAll()
+                // Alias-aware invalidation: only clear entries that may alias.
+                invalidateMayAlias(addr, in: &localVal, aa: aa)
+                // Re-add the current store's value for forwarding.
                 switch value {
                 case .intConst, .floatConst:
-                    localVal[key] = value
+                    localVal[key] = (addr: addr, value: value)
                 default:
                     break
                 }
 
             case .load(_, let addr):
                 let key = OpKey(addr)
-                // Intra-block load forwarding: replace load with forwarded constant.
-                if let storedVal = localVal[key] {
-                    fwd[b, default: [:]][ii] = storedVal
+                // Load forwarding: replace load with forwarded value.
+                if let entry = localVal[key] {
+                    fwd[b, default: [:]][ii] = entry.value
                 }
                 // The previous store to this address is observed — not dead.
                 cur.removeValue(forKey: key)
@@ -94,8 +114,6 @@ public func deadStoreElimination(in function: Function) -> Function {
 
             case .assign(let dest, _):
                 // Struct/union/array assign is a struct copy (writes to dest's memory).
-                // Clear forwarding cache conservatively — we can't tell which member
-                // addresses correspond to dest's fields without full alias analysis.
                 switch dest.type {
                 case .structType, .unionType, .array:
                     localVal.removeAll()
@@ -110,6 +128,82 @@ public func deadStoreElimination(in function: Function) -> Function {
 
         availOut[b] = cur
         availValOut[b] = localVal
+    }
+
+    // ── Phase 2: Backward must-kill dataflow for inter-block DSE ────────
+    // A store is dead if on ALL forward paths, the same address is overwritten
+    // before being read (or before function exit with no observable effect).
+
+    // Build successor map.
+    var succs: [[Int]] = Array(repeating: [], count: n)
+    let labelToIdx: [String: Int] = Dictionary(
+        uniqueKeysWithValues: blocks.enumerated().map { ($1.label, $0) })
+    for (bi, block) in blocks.enumerated() {
+        for label in block.terminator.successorLabels {
+            if let si = labelToIdx[label] { succs[bi].append(si) }
+        }
+    }
+
+    // OpKey → representative address Operand (for alias queries on loads).
+    var keyToAddr: [OpKey: Operand] = [:]
+    for block in blocks {
+        for instr in block.instructions {
+            if case .store(let addr, _) = instr {
+                keyToAddr[OpKey(addr)] = addr
+            }
+        }
+    }
+
+    if !keyToAddr.isEmpty {
+        let allStoreKeys = Set(keyToAddr.keys)
+
+        // mustKillIn[b]: address keys definitely stored (without intervening
+        // load/call) on all paths from block b's entry to function exit.
+        // Initialise to top (= allStoreKeys); narrows via intersection.
+        var mustKillIn: [Set<OpKey>] = Array(repeating: allStoreKeys, count: n)
+
+        // Backward dataflow in post-order (= reverse of rpoOrder).
+        let postOrder = Array(rpoOrder.reversed())
+        var bwChanged = true
+        while bwChanged {
+            bwChanged = false
+            for b in postOrder {
+                let killOut = mustKillOut(b, succs: succs, mustKillIn: mustKillIn)
+                let newIn = transferBackward(
+                    blocks[b], killOut: killOut, keyToAddr: keyToAddr, aa: aa)
+                if newIn != mustKillIn[b] {
+                    mustKillIn[b] = newIn
+                    bwChanged = true
+                }
+            }
+        }
+
+        // Identify inter-block dead stores using converged mustKillIn.
+        for b in 0..<n {
+            let killOut = mustKillOut(b, succs: succs, mustKillIn: mustKillIn)
+            var killed = killOut
+            for (ii, instr) in blocks[b].instructions.enumerated().reversed() {
+                switch instr {
+                case .store(let addr, _):
+                    let key = OpKey(addr)
+                    if killed.contains(key) {
+                        dead[b, default: []].insert(ii)
+                    }
+                    killed.insert(key)
+                case .load(_, let addr):
+                    removeObserved(addr, from: &killed, keyToAddr: keyToAddr, aa: aa)
+                case .call, .cas, .exchange, .asm:
+                    killed.removeAll()
+                case .assign(let dest, _):
+                    switch dest.type {
+                    case .structType, .unionType, .array:
+                        killed.removeAll()
+                    default: break
+                    }
+                default: break
+                }
+            }
+        }
     }
 
     let hasChanges = !dead.isEmpty || !fwd.isEmpty
@@ -135,4 +229,84 @@ public func deadStoreElimination(in function: Function) -> Function {
         newBlocks[bi] = block.with(instructions: newInstrs)
     }
     return withBlocks(function, newBlocks)
+}
+
+// MARK: - Backward DSE helpers
+
+/// Compute mustKillOut for block `b`: intersection of mustKillIn across all successors.
+/// Exit blocks (no successors) return empty — stores before `ret` may be externally visible.
+private func mustKillOut(
+    _ b: Int,
+    succs: [[Int]],
+    mustKillIn: [Set<OpKey>]
+) -> Set<OpKey> {
+    guard !succs[b].isEmpty else { return [] }
+    var result = mustKillIn[succs[b][0]]
+    for s in succs[b].dropFirst() {
+        result.formIntersection(mustKillIn[s])
+    }
+    return result
+}
+
+/// Backward transfer function: scan block bottom-to-top, return mustKillIn.
+private func transferBackward(
+    _ block: Block,
+    killOut: Set<OpKey>,
+    keyToAddr: [OpKey: Operand],
+    aa: AliasAnalysis
+) -> Set<OpKey> {
+    var killed = killOut
+    for instr in block.instructions.reversed() {
+        switch instr {
+        case .store(let addr, _):
+            killed.insert(OpKey(addr))
+        case .load(_, let addr):
+            removeObserved(addr, from: &killed, keyToAddr: keyToAddr, aa: aa)
+        case .call, .cas, .exchange, .asm:
+            killed.removeAll()
+        case .assign(let dest, _):
+            switch dest.type {
+            case .structType, .unionType, .array:
+                killed.removeAll()
+            default: break
+            }
+        default: break
+        }
+    }
+    return killed
+}
+
+/// Remove all keys from `killed` whose address may-alias the loaded address.
+private func removeObserved(
+    _ loadAddr: Operand,
+    from killed: inout Set<OpKey>,
+    keyToAddr: [OpKey: Operand],
+    aa: AliasAnalysis
+) {
+    guard aa.knownPointsTo(loadAddr) != nil else {
+        // Unknown pointer — may alias anything.
+        killed.removeAll()
+        return
+    }
+    killed = killed.filter { key in
+        guard let storedAddr = keyToAddr[key] else { return true }
+        return !aa.mayAlias(loadAddr, storedAddr)
+    }
+}
+
+/// Remove entries from `localVal` whose address may-alias `storeAddr`.
+private func invalidateMayAlias(
+    _ storeAddr: Operand,
+    in localVal: inout [OpKey: (addr: Operand, value: Operand)],
+    aa: AliasAnalysis
+) {
+    // If the store address has unknown points-to, conservatively clear all.
+    guard aa.knownPointsTo(storeAddr) != nil else {
+        localVal.removeAll()
+        return
+    }
+    // Remove only entries whose address may alias the store address.
+    localVal = localVal.filter { (_, entry) in
+        !aa.mayAlias(storeAddr, entry.addr)
+    }
 }
